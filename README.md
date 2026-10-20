@@ -43,3 +43,7 @@ RAM 权限仅覆盖该桶。新增分支需要先配置它自己的环境和测�
 - 不自动清理持久卷或测试记录；删除卷会永久删除该环境数据库。
 
 部署成功以 Actions 成功、HTTPS `/ready`、版本回执和实际功能验证为准。
+
+当前站点：<https://tashan-tuyan-codex-test.tashan.chat/>。
+部署和持久化检查已通过；真实生图等待测试账号的 TokenDance 授权。
+具体证据和未完成项见 [验收记录](deploy/tashan/ACCEPTANCE.md)。

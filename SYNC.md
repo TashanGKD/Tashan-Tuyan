@@ -13,7 +13,11 @@
   a real read-only business request gates deployment success. This container
   pins its allocated port to loopback so restarts preserve Nginx connectivity.
 - [x] Preview signup explains the email/password flow without email delivery.
-- [ ] Runtime verification: record actual deployment and acceptance evidence.
-- [ ] External integrations: email delivery, Watcha SSO, gVisor plot execution,
-  foreign-provider routing and real model generation need separate validation.
+- [x] Runtime verification: deployment `68efcd0`, HTTPS/business readiness,
+  independent account/attachment isolation, image update and explicit restart
+  persistence passed. See `deploy/tashan/ACCEPTANCE.md`.
+- [ ] Real generation: user will authorize TokenDance in the independent test
+  account, then validate a real output and its persisted history.
+- [ ] External integrations remain disabled/unverified: email delivery, Watcha
+  SSO, gVisor plot execution and additional foreign-provider routing.
 - [x] Mini Program / production: no changes.
