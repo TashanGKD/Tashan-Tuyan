@@ -16,8 +16,10 @@
 - [x] Runtime verification: deployment `68efcd0`, HTTPS/business readiness,
   independent account/attachment isolation, image update and explicit restart
   persistence passed. See `deploy/tashan/ACCEPTANCE.md`.
-- [ ] Real generation: user will authorize TokenDance in the independent test
-  account, then validate a real output and its persisted history.
+- [x] Real PNG generation: user authorized TokenDance in the independent account;
+  Qwen3.8 Flash + Seedream 5.0 lite produced a downloadable PNG. Result and
+  completed history survived page reload. Text spelling remains a visual-quality
+  issue; this does not establish SVG/all-model acceptance. See acceptance record.
 - [ ] External integrations remain disabled/unverified: email delivery, Watcha
   SSO, gVisor plot execution and additional foreign-provider routing.
 - [x] Mini Program / production: no changes.
