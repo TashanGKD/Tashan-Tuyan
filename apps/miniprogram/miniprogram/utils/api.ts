@@ -1,0 +1,240 @@
+import { referenceUploadTimeout } from './reference-upload-policy'
+import { API_ENDPOINT, AUTH_BASE, AUTH_COOKIE_KEY } from './config'
+import { BusinessError, businessErrorGuidance, toBusinessError } from './business-errors'
+
+export interface WxRequestResult<T> {
+  data: T
+  statusCode: number
+  header: WechatMiniprogram.IAnyObject
+  cookies?: string[]
+}
+
+export interface RequestOptions {
+  auth?: boolean
+  timeout?: number
+  isCurrent?: () => boolean
+}
+
+export function requestJson<T>(body: WechatMiniprogram.IAnyObject, options: RequestOptions = {}): Promise<T> {
+  return postJson<T>(API_ENDPOINT, body, options)
+}
+
+// 仅用于无副作用的公开健康探测。微信 Cronet 偶发关闭复用连接时允许再探测一次；
+// 创建任务、精修等可能计费的业务请求仍由 requestJson 单次发送，绝不自动重试。
+export async function requestHealth<T>(): Promise<T> {
+  const probe = () => requestJson<T>({ action: 'health' }, { auth: false, timeout: 15000 })
+  try {
+    return await probe()
+  } catch (error) {
+    if (!isRetryableHealthTransportError(error)) throw error
+    return probe()
+  }
+}
+
+export function isRetryableHealthTransportError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || '')
+  return /ERR_CONNECTION_(?:CLOSED|RESET|ABORTED)|ERR_NETWORK_CHANGED|network connection (?:lost|closed)|socket (?:is )?closed/i.test(message)
+}
+
+// 防御解析：wx.request 严格 JSON.parse 失败时 res.data 会退化为字符串（如网关/代理异常时
+// 返回的 HTML 错误页、或上游响应被意外破坏），导致轮询拿不到 job。这里清洗 0x00–0x1F 后
+// 重试解析（换行/制表符替换为空格），仍失败才原样返回交给错误处理。属通用兜底，非已知后端缺陷。
+export function coerceJsonResponse<T>(data: unknown): T {
+  if (typeof data !== 'string') return data as T
+  const text = data
+  try {
+    return JSON.parse(text) as T
+  } catch {
+    // fall through to sanitized retry
+  }
+  try {
+    const sanitized = text.replace(/[\u0000-\u001f]/g, (ch) => (ch === '\n' || ch === '\r' || ch === '\t' ? ' ' : ''))
+    return JSON.parse(sanitized) as T
+  } catch {
+    return data as T
+  }
+}
+
+export function authRequest<T>(path: string, method: 'GET' | 'POST', data?: WechatMiniprogram.IAnyObject, options: RequestOptions = {}): Promise<T> {
+  return gatewayRequest<T>(`${AUTH_BASE}${path}`, method, data, options)
+}
+
+export function gatewayRequest<T>(url: string, method: 'GET' | 'POST', data?: WechatMiniprogram.IAnyObject, options: RequestOptions = {}): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const header = requestHeader(options.auth !== false)
+    wx.request({
+      url,
+      method,
+      timeout: options.timeout || 60000,
+      header,
+      data,
+      success(res: WxRequestResult<T & { message?: string; code?: string; error?: string }>) {
+        if (options.isCurrent && !options.isCurrent()) { reject(new Error('账号或操作已变化，请重新尝试。')); return }
+        if (options.auth !== false) persistCookies(res)
+        const responseData = coerceJsonResponse<T & { message?: string; code?: string; error?: string }>(res.data)
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          const body = responseData || ({} as T & { message?: string; code?: string; error?: string })
+          reject(toBusinessError(res.statusCode, body, res.header))
+          return
+        }
+        resolve(responseData as T)
+      },
+      fail(error) {
+        reject(new Error(error.errMsg || '网络请求失败'))
+      },
+    })
+  })
+}
+
+export function postJson<T>(url: string, body: WechatMiniprogram.IAnyObject, options: RequestOptions = {}): Promise<T> {
+  return new Promise((resolve, reject) => {
+    wx.request({
+      url,
+      method: 'POST',
+      timeout: options.timeout || 60000,
+      header: requestHeader(options.auth !== false),
+      data: body,
+      success(res: WxRequestResult<T & { code?: number; error?: string; detail?: string }>) {
+        if (options.isCurrent && !options.isCurrent()) { reject(new Error('账号或操作已变化，请重新尝试。')); return }
+        if (options.auth !== false) persistCookies(res)
+        const data = coerceJsonResponse<T & { code?: number; error?: string; detail?: string }>(res.data) || ({} as T & { code?: number; error?: string; detail?: string })
+        if (res.statusCode < 200 || res.statusCode >= 300 || (data.code && data.code !== 0)) {
+          reject(toBusinessError(res.statusCode, data, res.header))
+          return
+        }
+        resolve(data)
+      },
+      fail(error) {
+        reject(new Error(error.errMsg || '网络请求失败'))
+      },
+    })
+  })
+}
+
+export function uploadReferenceFile(filePath: string, uploadUrl: string, mimeType: string, expiresAt?: number, onTask?: (task: WechatMiniprogram.RequestTask) => void): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (!referenceUploadTimeout(expiresAt)) { reject(new Error('参考图上传地址已过期，请重试。')); return }
+    wx.getFileSystemManager().readFile({
+      filePath,
+      success(readResult) {
+        const timeout = Math.min(600000, referenceUploadTimeout(expiresAt))
+        if (!timeout) { reject(new Error('参考图上传地址已过期，请重试。')); return }
+        const task = wx.request({
+          url: uploadUrl,
+          method: 'PUT',
+          timeout,
+          header: {
+            'Content-Type': mimeType,
+          },
+          data: readResult.data,
+          success(res) {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              resolve()
+              return
+            }
+            reject(new Error(`参考图上传失败：HTTP ${res.statusCode}`))
+          },
+          fail(error) {
+            reject(new Error(error.errMsg || '参考图上传失败'))
+          },
+        })
+        onTask?.(task)
+      },
+      fail(error) {
+        reject(new Error(error.errMsg || '读取参考图失败'))
+      },
+    })
+  })
+}
+
+export function requestHeader(includeAuth: boolean): WechatMiniprogram.IAnyObject {
+  const header: WechatMiniprogram.IAnyObject = {
+    'content-type': 'application/json',
+  }
+  const cookie = wx.getStorageSync(AUTH_COOKIE_KEY)
+  if (includeAuth && typeof cookie === 'string' && cookie) {
+    header.Cookie = cookie
+  }
+  return header
+}
+
+export function persistCookies<T>(res: WxRequestResult<T>) {
+  const cookieLines: string[] = []
+  if (Array.isArray(res.cookies)) {
+    cookieLines.push(...res.cookies)
+  }
+
+  const header = res.header || {}
+  const setCookie = header['Set-Cookie'] || header['set-cookie']
+  if (Array.isArray(setCookie)) {
+    cookieLines.push(...setCookie)
+  } else if (typeof setCookie === 'string') {
+    cookieLines.push(...splitSetCookieHeader(setCookie))
+  }
+
+  if (!cookieLines.length) return
+
+  const cookieMap = parseCookieHeader(wx.getStorageSync(AUTH_COOKIE_KEY) || '')
+  cookieLines.forEach((line) => {
+    const pair = String(line).split(';')[0]
+    const index = pair.indexOf('=')
+    if (index <= 0) return
+    const name = pair.slice(0, index).trim()
+    const value = pair.slice(index + 1).trim()
+    if (!value) {
+      cookieMap.delete(name)
+    } else {
+      cookieMap.set(name, value)
+    }
+  })
+
+  const nextCookie = Array.from(cookieMap.entries()).map(([name, value]) => `${name}=${value}`).join('; ')
+  if (nextCookie) {
+    wx.setStorageSync(AUTH_COOKIE_KEY, nextCookie)
+  } else {
+    wx.removeStorageSync(AUTH_COOKIE_KEY)
+  }
+}
+
+function splitSetCookieHeader(header: string): string[] {
+  return header.split(/,(?=\s*[^;,=\s]+=[^;,]*)/g).map((item) => item.trim()).filter(Boolean)
+}
+
+function parseCookieHeader(header: string): Map<string, string> {
+  const cookieMap = new Map<string, string>()
+  header.split(';').forEach((part) => {
+    const pair = part.trim()
+    const index = pair.indexOf('=')
+    if (index <= 0) return
+    cookieMap.set(pair.slice(0, index), pair.slice(index + 1))
+  })
+  return cookieMap
+}
+
+export function formatError(error: unknown): string {
+  const message = error instanceof BusinessError ? `${error.businessCode} ${error.message}` : error instanceof Error ? error.message : String(error || '')
+  if (/ACCOUNT_DELETION_REVIEW_REQUIRED/.test(message)) return '此前的注销未完整结束，需要核对已清理的数据后处理，请联系作者。'
+  if (/ACCOUNT_LIFECYCLE_CLOSED|no longer accepting credential/.test(message)) return '该账号正在注销或已失效，无法建立新的登录会话。'
+  if (/Account deletion is in progress|ACCOUNT_DELETION_IN_PROGRESS/i.test(message)) return '当前账号正在注销，请打开账号设置查看处理状态。'
+  if (/ACCOUNT_DELETION_(PROCESSING|RETRY_SCHEDULED|WAITING_FOR_)/.test(message)) return '注销申请已受理，后台会自动继续处理。'
+  if (/ACCOUNT_DELETION_CONTRACT_UNAVAILABLE/.test(message)) return '账号注销服务正在升级，请稍后重试。'
+
+  if (error instanceof BusinessError) return businessErrorGuidance(error).message
+  if (message.includes('Invalid email or password')) return '邮箱或密码不正确。'
+  if (message.includes('Invalid origin') || message.includes('Origin not allowed')) {
+    return '登录请求被后端来源校验拦截。需要在网关的 FRONTEND_ORIGINS / Better Auth trustedOrigins 放行微信小程序来源后重新部署。'
+  }
+  if (message.includes('User already exists')) return '这个邮箱已经注册，请直接登录。'
+  if (message.includes('Missing API key')) return '缺少所选模型接口的 API Key。'
+  if (message.includes('Incorrect API key') || message.includes('apikey-error')) {
+    return 'API Key 不正确。请确认当前选择的模型服务和填写的密钥匹配；如果选择阿里百炼，需要填写百炼控制台创建的 sk- 开头 API Key。'
+  }
+  if (message.includes('Please log in') || message.includes('请先登录') || message.includes('Unauthorized')) return '请先登录后再使用任务记录。'
+  if (message.includes('Forbidden')) return '当前账号没有权限查看这个任务。'
+  if (message.includes('url not in domain list')) return '请先在小程序后台配置 request 合法域名。'
+  if (isRetryableHealthTransportError(error)) return '网络连接临时中断，请稍后重试。'
+  if (message.includes('timeout')) return '请求超时，请稍后重试。'
+  if (message.includes('Invalid gateway token')) return '后端网关配置异常。'
+  if (message.includes('password')) return '密码至少需要 8 位。'
+  return message || '操作失败'
+}

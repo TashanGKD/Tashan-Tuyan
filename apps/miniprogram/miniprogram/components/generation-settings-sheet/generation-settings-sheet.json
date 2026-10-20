@@ -1,0 +1,8 @@
+{
+  "component": true,
+  "usingComponents": {
+    "model-picker": "/components/model-picker/model-picker",
+    "reference-library": "/components/reference-library/reference-library",
+    "ratio-picker": "/components/ratio-picker/ratio-picker"
+  }
+}

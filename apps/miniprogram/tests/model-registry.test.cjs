@@ -1,0 +1,132 @@
+const assert = require('node:assert/strict')
+
+const {
+  MODEL_PROVIDER_IDS,
+  groupRegistryModels,
+  modelAvailabilityPresentation,
+  normalizeModelRegistry,
+  partitionRegistryModels,
+} = require('../miniprogram/utils/model-registry.js')
+
+function provider(id) {
+  return {
+    accessKind: id === 'openrouter' ? 'aggregator' : 'direct',
+    routeContractVersion: 1,
+    accountCatalogRequired: id === 'ark',
+    defaults: { main: `${id}-main`, image: `${id}-image`, vision: `${id}-vision` },
+    models: [
+      { id: `${id}-main`, label: 'Main', vendor: 'Vendor A', lifecycle: 'stable', verificationState: 'registry', verified: true, selectable: true, roles: ['main'] },
+      { id: `${id}-image`, label: 'Image', vendor: 'Vendor B', lifecycle: 'stable', verificationState: 'catalog', verified: false, selectable: true, roles: ['image'], capabilities: { outputFormats: ['png'], aspectRatios: ['1:1'] } },
+      { id: `${id}-vision`, label: 'Vision', vendor: 'Vendor A', lifecycle: 'unknown', verificationState: 'unverified', verified: false, selectable: true, roles: ['vision'] },
+    ],
+  }
+}
+
+function registry() {
+  return {
+    code: 0,
+    registryVersion: '2026-08-21.v9',
+    routeContractVersion: 1,
+    supportsModelRoutes: true,
+    providers: Object.fromEntries(MODEL_PROVIDER_IDS.map((id) => [id, provider(id)])),
+  }
+}
+
+assert.deepEqual(MODEL_PROVIDER_IDS, ['gemini', 'openai', 'bailian', 'ark', 'openrouter', 'deepseek', 'kimi', 'zhipu', 'siliconflow', 'anthropic', 'recraft', 'xai', 'bfl', 'stability', 'ideogram', 'minimax', 'mistral', 'together', 'fireworks', 'fal', 'replicate', 'runware', 'tokenhub', 'xiaomi', 'sensenova', 'stepfun', 'qianfan', 'iflytek', 'longcat', 'antling', 'novita', 'tokendance'])
+const normalized = normalizeModelRegistry(registry())
+assert.equal(normalized.registryVersion, '2026-08-21.v9')
+assert.equal(normalized.providers.openrouter.models.length, 3)
+assert.throws(() => normalizeModelRegistry({ ...registry(), providers: { openai: provider('openai') } }), /五个 API 渠道/)
+assert.throws(() => normalizeModelRegistry({ ...registry(), routeContractVersion: 0 }), /模型路由契约/)
+assert.throws(() => normalizeModelRegistry({ ...registry(), providers: { ...registry().providers, openai: { ...provider('openai'), defaults: { main: 'missing', image: 'openai-image', vision: 'openai-vision' } } } }), /默认主模型/)
+
+assert.deepEqual(modelAvailabilityPresentation({ lifecycle: 'stable', verificationState: 'registry', verified: true }), {
+  lifecycleLabel: '稳定', verificationLabel: '注册表已验证', verifiedForAccount: false,
+})
+assert.equal(modelAvailabilityPresentation({ lifecycle: 'unknown', verificationState: 'catalog' }).lifecycleLabel, '生命周期未知')
+assert.equal(modelAvailabilityPresentation({ lifecycle: 'stable', verificationState: 'catalog' }).verificationLabel, '官方目录')
+assert.equal(modelAvailabilityPresentation({ lifecycle: 'stable', verificationState: 'inference-verified' }).verifiedForAccount, true)
+
+const partition = partitionRegistryModels([
+  { id: 'ok', vendor: 'OpenAI', roles: ['image'], selectable: true, capabilities: { outputFormats: ['png'] } },
+  { id: 'disabled', vendor: 'Google', roles: ['image'], selectable: false, disabledReason: '当前账号无权益' },
+  { id: 'wrong', vendor: 'OpenAI', roles: ['main'], roleReasons: { image: '不提供图片输出' } },
+], { role: 'image', outputFormat: 'png' })
+assert.deepEqual(partition.compatible.map((item) => item.id), ['ok'])
+assert.deepEqual(partition.incompatible.map((item) => item.selectionDisabledReason), ['不提供图片输出'])
+assert.deepEqual(groupRegistryModels(partition.compatible).map((group) => group.vendor), ['OpenAI'])
+
+console.log('model-registry.test.cjs passed')
+
+// Older servers remain usable while new channels roll out. New partial-role
+// catalogs are valid only when every role they do expose has a valid default.
+const previousProviders = Object.fromEntries(['gemini', 'openai', 'bailian', 'ark', 'openrouter'].map((id) => [id, provider(id)]))
+assert.equal(normalizeModelRegistry({ ...registry(), providers: previousProviders }).providers.xai, undefined)
+const textOnly = { ...provider('anthropic'), defaults: { main: 'anthropic-main', image: '', vision: 'anthropic-vision' }, models: provider('anthropic').models.filter((item) => !item.roles.includes('image')) }
+const imageOnly = { ...provider('recraft'), defaults: { main: '', image: 'recraft-image', vision: '' }, models: provider('recraft').models.filter((item) => item.roles.includes('image')) }
+const partial = normalizeModelRegistry({ ...registry(), providers: { ...previousProviders, anthropic: textOnly, recraft: imageOnly } })
+assert.equal(partial.providers.anthropic.defaults.image, '')
+assert.equal(partial.providers.recraft.defaults.main, '')
+assert.throws(() => normalizeModelRegistry({ ...registry(), providers: { ...previousProviders, anthropic: { ...textOnly, defaults: { ...textOnly.defaults, main: '' } } } }), /默认主模型/)
+
+const datedFixture = registry()
+datedFixture.providers.openai.models[0].expirationDate = '2000-01-01'
+datedFixture.providers.openai.models[1].earliestRetirementDate = '2000-01-01'
+datedFixture.providers.openai.models[1].replacementModelId = 'next-image'
+datedFixture.providers.openai.models[1].regions = ['cn-beijing']
+datedFixture.providers.openai.models[1].roleProtocols = { image: 'openai-images' }
+const dated = normalizeModelRegistry(datedFixture)
+const datedImage = dated.providers.openai.models.find(item => item.id === datedFixture.providers.openai.models[1].id)
+assert.equal(partitionRegistryModels(dated.providers.openai.models, { role: 'main' }).compatible.length, 0)
+assert.equal(partitionRegistryModels(dated.providers.openai.models, { role: 'image' }).compatible.length, 1)
+assert.equal(datedImage.earliestRetirementDate, '2000-01-01')
+assert.equal(datedImage.replacementModelId, 'next-image')
+assert.deepEqual(datedImage.roleProtocols, { image: 'openai-images' })
+assert.deepEqual(datedImage.regions, ['cn-beijing'])
+
+const originalNow = Date.now
+const zoneFixture = registry()
+zoneFixture.providers.openai.models[0].expirationDate = '2026-10-10'
+zoneFixture.providers.openai.models[0].expirationAt = '2026-10-10T00:00:00+08:00'
+const zoned = normalizeModelRegistry(zoneFixture).providers.openai.models
+try {
+  Date.now = () => Date.parse('2026-10-09T15:59:59.999Z')
+  assert.equal(partitionRegistryModels(zoned, { role: 'main' }).compatible.length, 1)
+  Date.now = () => Date.parse('2026-10-09T16:00:00Z')
+  assert.equal(partitionRegistryModels(zoned, { role: 'main' }).incompatible.length, 0)
+} finally { Date.now = originalNow }
+
+const uploadPolicy = require('../miniprogram/utils/reference-upload-policy.js')
+const withUpload = normalizeModelRegistry({ ...registry(), referenceUpload: uploadPolicy.referenceUploadContract() })
+assert.equal(withUpload.referenceUpload.platform.maxTotalBytes, 80 * 1024 * 1024)
+const referenceFiles = Array.from({length:8}, () => ({size: 6 * 1024 * 1024}))
+const qwenPolicy = uploadPolicy.activeReferenceUploadPolicy(withUpload.referenceUpload, {accessProvider:'tokendance', modelId:'qwen3.8-flash'})
+assert.equal(uploadPolicy.referenceUploadSelectionError(referenceFiles, qwenPolicy), '')
+const stricter = uploadPolicy.activeReferenceUploadPolicy(withUpload.referenceUpload, {accessProvider:'zhipu',modelId:'glm-4v-flash'})
+assert.match(uploadPolicy.referenceUploadSelectionError(referenceFiles, stricter), /文件已保留/)
+assert.equal(referenceFiles.length, 8)
+
+// TokenDance quarantines stay visible and preserve saved/default selections;
+// they never authorize invocation or relax validation for other providers.
+const quarantinedCatalog = registry()
+quarantinedCatalog.providers.tokendance = provider('tokendance')
+quarantinedCatalog.providers.tokendance.models.forEach(model => { model.selectable = false; model.disabledReason = 'supported_protocols 返回 null，已暂停调用。' })
+quarantinedCatalog.catalogWarnings = { tokendance: '部分模型异常，其他模型可用。' }
+const quarantine = normalizeModelRegistry(quarantinedCatalog)
+assert.equal(quarantine.providers.tokendance.defaults.main, 'tokendance-main')
+assert.equal(quarantine.providers.bailian.models[0].selectable, true)
+assert.equal(quarantine.catalogWarnings.tokendance, quarantinedCatalog.catalogWarnings.tokendance)
+const { buildModelSubmission } = require('../miniprogram/utils/model-routing.js')
+const routes = Object.fromEntries(['main', 'image', 'vision'].map(role => [role, { accessProvider: 'tokendance', modelId: 'tokendance-' + role }]))
+assert.throws(() => buildModelSubmission({ configurationMode: 'advanced', modelRoutes: routes, registry: quarantine }), /null/)
+assert.equal(routes.main.modelId, 'tokendance-main')
+quarantinedCatalog.providers.openai.models[0].selectable = false
+assert.throws(() => normalizeModelRegistry(quarantinedCatalog), /默认主模型/)
+
+// A retired default remains visible for existing configuration; submission is blocked separately.
+const retiredRegistry = registry()
+retiredRegistry.providers.deepseek.models[2].selectable = false
+retiredRegistry.providers.deepseek.models[2].disabledReason = '渠道已确认停用；请手动选择。'
+const withRetired = normalizeModelRegistry(retiredRegistry)
+assert.equal(withRetired.providers.deepseek.defaults.vision, 'deepseek-vision')
+assert.equal(withRetired.providers.deepseek.models.find(m => m.id === 'deepseek-vision').selectable, false)

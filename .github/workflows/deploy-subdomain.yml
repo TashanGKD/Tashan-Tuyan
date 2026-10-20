@@ -1,0 +1,105 @@
+name: Tuyan isolated Tashan preview
+on:
+  push:
+    branches: ['codex/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: tashan-preview-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  identity:
+    if: github.repository == 'TashanGKD/tuyan-preview' && startsWith(github.ref, 'refs/heads/codex/')
+    runs-on: ubuntu-latest
+    outputs:
+      uid: ${{ steps.identity.outputs.uid }}
+      origin: ${{ steps.identity.outputs.origin }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: identity
+        env:
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: python3 deploy/tashan/identity.py "$REPOSITORY" "$BRANCH" >> "$GITHUB_OUTPUT"
+  build:
+    needs: identity
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: pnpm
+      - run: pnpm install --filter @paperbanana/web... --filter @paperbanana/paperbanana-api... --filter @paperbanana/auth-gateway... --filter @paperbanana/benchmark-worker... --frozen-lockfile
+      - run: node --test deploy/tashan/preview.test.mjs
+      - run: pnpm --filter @paperbanana/paperbanana-api check
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ghcr.io/tashangkd/tuyan-preview:sha-${{ github.sha }}
+          build-args: |
+            TUYAN_PREVIEW_ORIGIN=${{ needs.identity.outputs.origin }}
+            TUYAN_REVISION=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+  deploy:
+    needs: [identity, build]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.identity.outputs.uid }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy this preview only
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+          PREVIEW_OSS_CONFIG: ${{ secrets.PREVIEW_OSS_CONFIG }}
+          UID_NAME: ${{ needs.identity.outputs.uid }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test "$DEPLOY_HOST" = tashan.chat
+          test "$DEPLOY_USER" = deploy
+          test -n "$PREVIEW_OSS_CONFIG"
+          task_ssh_dir="$(mktemp -d)"
+          trap 'rm -rf "$task_ssh_dir"' EXIT
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$task_ssh_dir/key"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$task_ssh_dir/known_hosts"
+          chmod 600 "$task_ssh_dir/key"
+          ssh_args=(-i "$task_ssh_dir/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$task_ssh_dir/known_hosts")
+          target="$DEPLOY_USER@$DEPLOY_HOST"
+          remote="tuyan-previews/$UID_NAME"
+          ssh "${ssh_args[@]}" "$target" "umask 077; mkdir -p '$remote'"
+          printf '%s' "$PREVIEW_OSS_CONFIG" | ssh "${ssh_args[@]}" "$target" "umask 077; cat > '$remote/external.json'"
+          scp "${ssh_args[@]}" deploy/tashan/deploy.sh "$target:$remote/deploy.sh"
+          docker_config="/tmp/$UID_NAME-${GITHUB_RUN_ID}-docker"
+          printf '%s' "$GH_TOKEN" | ssh "${ssh_args[@]}" "$target" "umask 077; docker --config '$docker_config' login ghcr.io -u '$ACTOR' --password-stdin"
+          ssh "${ssh_args[@]}" "$target" "DOCKER_CONFIG='$docker_config' bash '$remote/deploy.sh' 'ghcr.io/tashangkd/tuyan-preview@$DIGEST' '$UID_NAME' '$GITHUB_SHA' '$BRANCH'"
+          ssh "${ssh_args[@]}" "$target" "rm -rf '$docker_config'"
+          echo "Preview: https://$UID_NAME.tashan.chat/" >> "$GITHUB_STEP_SUMMARY"

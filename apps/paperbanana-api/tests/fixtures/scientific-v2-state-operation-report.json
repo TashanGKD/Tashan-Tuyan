@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 2,
+  "identity": {
+    "suiteId": "pb-scientific-figure-v2",
+    "evaluationMode": "codex_scientific_v2",
+    "evaluationEpoch": "codex-scientific-2026-09-v1",
+    "reviewProtocol": "codex-independent-double-review-v2",
+    "presentationVersion": "scientific-leaderboard-v2"
+  },
+  "kind": "worker",
+  "batchId": "scientific-v2-contract-fixture",
+  "batchManifestHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "revision": 1,
+  "previousStateHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "stateHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "state": {
+    "stateHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "status": "awaiting_artifacts"
+  },
+  "manifestCodeSha": "1111111111111111111111111111111111111111",
+  "executionCodeSha": "1111111111111111111111111111111111111111",
+  "legacyRecoveryStateHash": null,
+  "providerCanaryAttestation": {
+    "providers": [
+      "bailian",
+      "ark",
+      "openrouter"
+    ],
+    "passed": true,
+    "attemptSetHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "executionOrderAttestation": {
+    "slotIds": [
+      "provider-slot-1",
+      "codex-slot-1"
+    ],
+    "passed": true
+  },
+  "codexProvenance": null,
+  "disclosure": null,
+  "createdAt": "2026-08-31T00:00:00.000Z",
+  "reportHash": "31d64a61b35e43c5b12f0ccc221cd3068c35fe92ff0435c1e87d281983af20ce"
+}

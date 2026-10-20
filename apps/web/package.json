@@ -1,0 +1,32 @@
+{
+  "name": "@paperbanana/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "test": "node --import tsx --import ./tests/dom-setup.mjs --test",
+    "build": "vite build && node scripts/publish-agent-skills.mjs",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "@paperbanana/api": "workspace:*",
+    "better-auth": "^1.6.11",
+    "jszip": "^3.10.1",
+    "lucide-react": "^0.475.0",
+    "pdfjs-dist": "5.4.624",
+    "qrcode": "1.5.4",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.5",
+    "@vitejs/plugin-react": "^5.0.0",
+    "fake-indexeddb": "6.2.4",
+    "jsdom": "^30.0.1",
+    "sharp": "0.35.3",
+    "tsx": "^4.23.12",
+    "vite": "^7.0.0"
+  }
+}

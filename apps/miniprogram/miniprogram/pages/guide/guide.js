@@ -1,0 +1,66 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const model_presentation_1 = require("../../utils/model-presentation");
+const config_1 = require("../../utils/config");
+const model_registry_store_1 = require("../../utils/model-registry-store");
+const LINKS = {
+    site: { label: '网站端', url: 'https://www.paperbanana.asia/#guide-settings' },
+    github: { label: 'GitHub 仓库', url: 'https://github.com/yrjmdqmmx/Tuyan' },
+    paper: { label: 'PaperBanana 论文', url: 'https://huggingface.co/papers/2601.23265' },
+};
+const CHAPTERS = [
+    { id: 'quick', title: '三步开始生成', summary: '选模板与设置 → 写方法与图注 → 提交并查看演化', open: true },
+    { id: 'settings', title: '完整生成设置', summary: '普通/专业、三角色模型、格式、比例、清晰度与评审', open: false },
+    { id: 'models', title: '模型目录与渠道', summary: '渠道、区域与模型能力随服务端目录更新', open: false },
+    { id: 'references', title: '参考图库与上传', summary: '306 个案例、跨页选择，以及上传和检索互斥', open: false },
+    { id: 'refine', title: '独立精修', summary: '上传原图或历史结果，优化指令后继续编辑', open: false },
+    { id: 'records', title: '任务记录与错误', summary: '来源端、路由、输入、阶段、资产与重试建议', open: false },
+    { id: 'privacy', title: '账户与隐私', summary: '图研登录、观猹渠道授权与钱包；账号安全与隐私', open: false },
+];
+const SETTING_CARDS = [
+    ['配置模式', '普通模式可统一切换渠道；三个角色均可单独选择模型。跨渠道选择自动切换专业模式，保存后生效。'],
+    ['API 渠道', '先选接入渠道，再搜索或按厂商筛选模型。角色旁可配置凭据；同一渠道共享 Key，稀宇科技按区域分别保存。'],
+    ['主模型', '负责规划、SVG、统计图、自动检索和部分评审；只有任务真实可达主模型时才要求对应渠道密钥。'],
+    ['图像生成模型', '负责 PNG 渲染与精修；Recraft Vector 还可生成 SVG。比例、清晰度、输出格式和编辑模式以当前目录为准。'],
+    ['参考图识别模型', '上传参考图且主模型不直读时负责图像理解；未走到该角色时不会要求它的渠道密钥。'],
+    ['生成流程', '规划器 + 评审器适合日常质量；完整流程更细致；基础生成最快但跳过部分评审。'],
+    ['检索设置', '不检索、自动、随机或手动选择图库案例。上传参考图后检索强制关闭。'],
+    ['画面比例', '按当前模型与清晰度显示可用比例。灰掉或不出现的比例表示当前模型没有声明支持，系统不会静默改成 16:9。'],
+    ['导出格式', 'PNG 适合直接预览与精修；SVG 默认由主模型生成；选择 Recraft Vector 时由主模型规划、Recraft 生成，需两个渠道的 Key。'],
+    ['输出清晰度', '生成和精修分别提供模型实际支持的档位；原生尺寸表示由模型按源图决定。'],
+    ['候选数量', '一次生成 1–3 张独立候选，数量越多耗时与计费越高。'],
+    ['评审轮数', '0–2 轮“评审 → 重渲染”；轮数越多通常更细致，也会增加时间与费用。'],
+    ['输入优化', '方法、图注、负向提示词和精修指令均可优化。仅调用所选主模型；观猹使用服务端授权，其他渠道使用 BYOK，可能计费；结果先预览，确认采用后替换，也可恢复原文。'],
+    ['负向提示词', '单独描述不希望出现的内容，最多 1000 字；它会独立落盘，不拼进研究方法。'],
+];
+Component({
+    data: {
+        qrSrc: '/images/contact-qr.jpg', clientVersion: config_1.CLIENT_VERSION, showFeedbackPanel: false, scrollAnchor: '',
+        chapters: CHAPTERS, settingCards: SETTING_CARDS.map(([name, description]) => ({ name, description })),
+        registryVersion: '正在读取', providerChannels: [], channelsExpanded: false, registryError: '',
+    },
+    lifetimes: {
+        attached() { ; this.unsubscribeRegistry = (0, model_registry_store_1.subscribeModelRegistry)((state) => this.applyRegistry(state)); void (0, model_registry_store_1.loadModelRegistry)(); },
+        detached() { const unsubscribe = this.unsubscribeRegistry; if (unsubscribe)
+            unsubscribe(); },
+    },
+    methods: {
+        applyRegistry(state) {
+            if (!state.registry) {
+                this.setData({ registryVersion: '目录不可用', providerChannels: [], registryError: state.error });
+                return;
+            }
+            const providerChannels = (0, model_presentation_1.orderModelChannels)(Object.keys(state.registry.providers)).map(id => ({ id, label: model_presentation_1.MODEL_CHANNEL_LABELS[id] || id }));
+            this.setData({ registryVersion: state.registry.registryVersion, providerChannels, registryError: '' });
+        },
+        toggleChannels() { this.setData({ channelsExpanded: !this.data.channelsExpanded }); },
+        toggleChapter(event) { const index = Number(event.currentTarget.dataset.index); if (!Number.isInteger(index))
+            return; const chapters = this.data.chapters.map((chapter, chapterIndex) => chapterIndex === index ? { ...chapter, open: !chapter.open } : chapter); this.setData({ chapters }); },
+        goGenerate() { wx.switchTab({ url: '/pages/index/index' }); },
+        scrollToContact() { this.setData({ scrollAnchor: '' }); wx.nextTick(() => this.setData({ scrollAnchor: 'contact-section' })); },
+        copyLink(event) { const link = LINKS[String(event.currentTarget.dataset.key || '')]; if (link)
+            wx.setClipboardData({ data: link.url, success() { wx.showToast({ title: `${link.label}链接已复制`, icon: 'none' }); } }); },
+        openFeedbackPanel() { this.setData({ showFeedbackPanel: true }); }, closeFeedbackPanel() { this.setData({ showFeedbackPanel: false }); },
+        onShareAppMessage() { return { title: '图研Tuyan · 使用教程', path: '/pages/guide/guide' }; },
+    },
+});

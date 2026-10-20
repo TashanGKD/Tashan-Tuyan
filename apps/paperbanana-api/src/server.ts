@@ -1,0 +1,363 @@
+import { TOKENDANCE_ACTIONS, TokenDanceError } from '../../../packages/api/src/tokendance.js'
+import type { createTokenDanceService } from './tokendance-service.js'
+import type { createProviderWorkflow } from './provider-workflow.js'
+import { ADMIN_OPERATIONS_ACTIONS, AdminError } from './admin-policy.js'
+import { createHash, timingSafeEqual } from 'node:crypto'
+import http from 'node:http'
+
+import express, { type Express, type NextFunction, type Request, type Response } from 'express'
+
+import { redactLogValue } from './redaction.js'
+
+export type CoreContext = {
+  request: { method: string }
+  body: Record<string, unknown>
+  headers: Request['headers']
+  response: {
+    setHeader(name: string, value: string): void
+    status(code: number): void
+  }
+}
+
+export type CoreHandler = (ctx: CoreContext) => unknown | Promise<unknown>
+export type Readiness = { ready: boolean; dependencies?: Record<string, unknown> }
+export type ReadinessProbe = () => Readiness | Promise<Readiness>
+export type ServiceLogger = {
+  info(message: string, fields?: unknown): void
+  warn(message: string, fields?: unknown): void
+  error(message: string, fields?: unknown): void
+}
+
+export type AppConfig = {
+  gatewayToken: string
+  adminToken?: string
+  adminTransportToken?: string
+  benchmarkDiscoveryToken?: string
+  serviceName: string
+  version: string
+}
+
+type AppDependencies = {
+  tokenDance?: ReturnType<typeof createTokenDanceService>
+  providerWorkflow?: ReturnType<typeof createProviderWorkflow>
+  resumeTokenDanceJob?: (task: any) => Promise<any>
+  requiresCustomCredential?: (body: Record<string, any>) => Promise<boolean>
+  requiresTokenDanceCredential?: (body: Record<string, any>) => Promise<boolean>
+  handler: CoreHandler
+  readinessProbe: ReadinessProbe
+  healthSnapshot: () => Readiness
+  config: AppConfig
+  logger: ServiceLogger
+  adminOperations?: { handle(body: Record<string, unknown>, isAdmin: boolean): Promise<Record<string, unknown>> }
+  benchmarkService?: {
+    handle(body: Record<string, unknown>, isAdmin: boolean): Promise<Record<string, unknown>>
+  }
+  prepareScientificV2RegistryAuthority?: () => Promise<Record<string, unknown>>
+}
+
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type,Authorization,X-Paperbanana-Gateway-Token',
+  'Access-Control-Max-Age': '86400',
+}
+
+const adminActions = new Set([
+  ...ADMIN_OPERATIONS_ACTIONS,
+  'adminJobs',
+  'adminFeedback',
+  'importReferences',
+  'evaluateJob',
+  'pingPlotWorker',
+  'adminBenchmarkCandidates',
+  'adminBenchmarkApprove',
+  'adminBenchmarkControl',
+  'adminBenchmarkReviewExport',
+  'adminBenchmarkReviewImport',
+  'adminBenchmarkPublish',
+  'adminBenchmarkPromptQueue',
+  'adminBenchmarkPromptDigest',
+  'adminBenchmarkPromptDecision',
+])
+
+const scientificV2AdminOperationHeader = 'x-paperbanana-scientific-v2-admin-operation'
+
+function scientificV2AdminDiagnosticCode(error: unknown) {
+  const message = String((error as Error)?.message || '')
+  if (/^SCIENTIFIC_V2_[A-Z0-9_]{1,96}$/.test(message)) return message
+  const mongoCode = Number((error as { code?: unknown })?.code)
+  if (!Number.isInteger(mongoCode) || mongoCode < 0 || mongoCode > 99999) return 'SCIENTIFIC_V2_INTERNAL_REJECTED'
+  const rawCodeName = String((error as { codeName?: unknown })?.codeName || '')
+  const codeName = /^[A-Za-z][A-Za-z0-9]{0,63}$/.test(rawCodeName)
+    ? rawCodeName.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toUpperCase()
+    : ''
+  return `MONGO_${mongoCode}${codeName ? `_${codeName}` : ''}`
+}
+
+function tokensMatch(actual: string, expected: string): boolean {
+  const actualDigest = createHash('sha256').update(actual).digest()
+  const expectedDigest = createHash('sha256').update(expected).digest()
+  return timingSafeEqual(actualDigest, expectedDigest)
+}
+
+function normalizedBody(value: unknown): Record<string, unknown> {
+  let body = value
+  if (typeof body === 'string') {
+    try {
+      body = JSON.parse(body)
+    } catch {
+      body = {}
+    }
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return {}
+  return { ...(body as Record<string, unknown>) }
+}
+
+function transportBody(value: unknown, config: AppConfig): Record<string, unknown> {
+  const body = normalizedBody(value)
+  delete body.gatewayToken
+  delete body.adminToken
+  body.gatewayToken = config.gatewayToken
+  return body
+}
+
+function applyCors(response: Response): void {
+  for (const [name, value] of Object.entries(corsHeaders)) response.setHeader(name, value)
+}
+
+function safeLegacyHeader(value: string | undefined, maxLength: number): string | undefined {
+  const normalized = String(value || '').replace(/[\r\n]/g, '').trim().slice(0, maxLength)
+  return normalized || undefined
+}
+
+function handlerHeaders(request: Request): Request['headers'] {
+  const headers: Request['headers'] = {}
+  const clientIp = safeLegacyHeader(request.get('x-paperbanana-client-ip'), 128)
+  const userAgent = safeLegacyHeader(request.get('user-agent'), 512)
+  const authUserId = safeLegacyHeader(request.get('x-paperbanana-auth-user-id'), 200)
+  if (clientIp) headers['x-paperbanana-client-ip'] = clientIp
+  if (userAgent) headers['user-agent'] = userAgent
+  // invokeLegacy validates the internal transport before exposing this assertion.
+  if (authUserId) headers['x-paperbanana-auth-user-id'] = authUserId
+  return headers
+}
+
+export function createApp({
+  handler, readinessProbe, healthSnapshot, config, logger, benchmarkService, adminOperations,
+  prepareScientificV2RegistryAuthority, tokenDance, providerWorkflow, resumeTokenDanceJob, requiresTokenDanceCredential, requiresCustomCredential,
+}: AppDependencies): Express {
+  const app = express()
+  app.disable('x-powered-by')
+  const standardJsonParser = express.json({ limit: '1mb', strict: false })
+  const scientificV2FreezeJsonParser = express.json({ limit: '8mb', strict: false })
+  app.use((request, response, next) => {
+    const declaredScientificOperation = request.get(scientificV2AdminOperationHeader)
+    const protectedFreezeTransport = request.method === 'POST'
+      && request.path === '/paperbanana-api'
+      && ['freeze', 'remediate-freeze', 'expansion-freeze', 'rereview'].includes(String(declaredScientificOperation))
+      && Boolean(config.adminTransportToken)
+      && tokensMatch(request.get('x-paperbanana-gateway-token') || '', config.gatewayToken)
+      && tokensMatch(request.get('x-paperbanana-admin-transport-token') || '', config.adminTransportToken || '')
+    return (protectedFreezeTransport ? scientificV2FreezeJsonParser : standardJsonParser)(request, response, next)
+  })
+  app.use((request, response, next) => {
+    applyCors(response)
+    response.on('finish', () => {
+      logger.info('request completed', {
+        method: request.method,
+        path: request.path,
+        status: response.statusCode,
+      })
+    })
+    next()
+  })
+
+  app.options('/paperbanana-api', (_request, response) => response.status(204).send())
+
+  function sendHealth(response: Response, readiness: Readiness, readinessOnly: boolean) {
+    return response.status(readinessOnly && !readiness.ready ? 503 : 200).json({
+      ok: readinessOnly ? readiness.ready : true,
+      service: config.serviceName,
+      runtime: 'node',
+      version: config.version,
+      ready: readiness.ready,
+      dependencies: readiness.dependencies || {},
+    })
+  }
+
+  async function readyResponse(response: Response) {
+    try {
+      const readiness = await readinessProbe()
+      return sendHealth(response, readiness, true)
+    } catch (error) {
+      logger.error('readiness probe failed', redactLogValue(error))
+      return sendHealth(response, { ready: false, dependencies: {} }, true)
+    }
+  }
+
+  app.get('/health', (_request, response) => sendHealth(response, healthSnapshot(), false))
+  app.get('/ready', (_request, response) => readyResponse(response))
+
+  async function invokeLegacy(request: Request, response: Response) {
+    const token = request.get('x-paperbanana-gateway-token') || ''
+    const gatewayTransport = tokensMatch(token, config.gatewayToken)
+    const discoveryTransport = Boolean(config.benchmarkDiscoveryToken && tokensMatch(token, config.benchmarkDiscoveryToken))
+    if (!gatewayTransport && !discoveryTransport) {
+      return response.status(401).json({ code: 401, error: 'Unauthorized internal transport' })
+    }
+
+    const incoming = request.method === 'GET' ? request.query : request.body
+    const body = transportBody(incoming, config)
+    const action = String(body.action || '')
+    if (discoveryTransport && !gatewayTransport && action !== 'modelRegistry') {
+      return response.status(403).json({ code: 403, error: 'Discovery transport is read-only' })
+    }
+    const adminTransport = request.get('x-paperbanana-admin-transport-token') || ''
+    const isAdminTransport = Boolean(
+      config.adminTransportToken
+      && adminTransport
+      && tokensMatch(adminTransport, config.adminTransportToken),
+    )
+    const usesCustom = action === 'universalApiCheck' || (body.mainRoute as any)?.accessProvider === 'custom' || Object.entries((body.modelRoutes || {}) as any).some(([role, route]: [string, any]) => (role !== 'vision' || body.visionMode !== 'none') && route?.accessProvider === 'custom')
+    if (usesCustom && (action==='universalApiCheck' || !requiresCustomCredential || await requiresCustomCredential(body))) {
+      const userId = safeLegacyHeader(request.get('x-paperbanana-auth-user-id'), 200) || ''
+      if (!userId) return response.status(401).json({code: 401, error: '通用 API 接入需要先登录。'})
+      body.userId = userId
+      response.setHeader('Cache-Control', 'no-store')
+    }
+    const tokenDanceAction = action === 'providerResume' || (TOKENDANCE_ACTIONS as readonly string[]).includes(action) || action === 'adminTokenDancePricing'
+    const usesTokenDance = ['createJob', 'refineImage', 'optimizeInputs'].includes(action) && (body.provider === 'tokendance' || (body.mainRoute as any)?.accessProvider === 'tokendance' || Object.entries((body.modelRoutes || {}) as any).some(([role, route]: [string, any]) => (role !== 'vision' || body.visionMode !== 'none') && route?.accessProvider === 'tokendance'))
+    // Client-supplied TD keys and identities are never authoritative.
+    if (body.apiKeys && typeof body.apiKeys === 'object') { body.apiKeys = { ...(body.apiKeys as object) }; delete (body.apiKeys as any).tokendance }
+    if (usesTokenDance || tokenDanceAction) {
+      response.setHeader('Cache-Control', 'no-store')
+      try {
+        const userId = safeLegacyHeader(request.get('x-paperbanana-auth-user-id'), 200) || ''
+        if (tokenDanceAction) {
+          if (!tokenDance) throw new TokenDanceError(503, '观猹 TokenDance 连接服务尚未配置。')
+          if (action === 'tokenDanceResume' || action === 'providerResume') {
+            if (!providerWorkflow || !resumeTokenDanceJob) throw new TokenDanceError(503, '任务恢复服务暂不可用。')
+            return response.json(await providerWorkflow.resume(String(body.jobId || ''), userId, resumeTokenDanceJob, typeof (body.apiKeys as any)?.custom === 'string' ? (body.apiKeys as any).custom : undefined))
+          }
+          return response.json(await tokenDance.handle(body, userId, isAdminTransport && Boolean(config.adminToken)))
+        }
+        if (!requiresTokenDanceCredential || await requiresTokenDanceCredential(body)) {
+          body.userId = userId
+          if (!tokenDance) throw new TokenDanceError(503, '观猹 TokenDance 连接服务尚未配置。')
+          const credential = await tokenDance.credential(userId)
+          body.apiKeys = { ...(body.apiKeys as object || {}), tokendance: credential.key }
+          if (action === 'optimizeInputs') body.apiKey = credential.key
+        }
+      } catch (error: any) {
+        const status = ['TokenDanceError','UniversalApiError'].includes(error?.name) ? error.status || 400 : 503
+        return response.status(status).json({ code: status, error: ['TokenDanceError','UniversalApiError'].includes(error?.name) ? error.message : '渠道连接或任务恢复服务暂不可用。', recoveryAction: error?.recoveryAction, retryAfterSeconds: error?.retryAfterSeconds || 0, uncertain: Boolean(error?.uncertain) })
+      }
+    }
+    if (action === 'getJob' && providerWorkflow) await providerWorkflow.reconcile(String(body.jobId || ''))
+    if (action === 'userJobs' && providerWorkflow) await providerWorkflow.reconcileUser(safeLegacyHeader(request.get('x-paperbanana-auth-user-id'), 200) || '')
+    const declaredScientificV2AdminOperation = request.get(scientificV2AdminOperationHeader) || ''
+    const isScientificV2Freeze = action === 'adminBenchmarkControl'
+      && body.evaluationMode === 'codex_scientific_v2'
+      && body.command === 'freezeBatch'
+    const isScientificV2RemediationFreeze = action === 'adminBenchmarkControl'
+      && body.evaluationMode === 'codex_scientific_v2'
+      && body.command === 'freezeRemediationBatch'
+    const isScientificV2ExpansionFreeze = action === 'adminBenchmarkControl'
+      && body.evaluationMode === 'codex_scientific_v2'
+      && body.command === 'freezeExpansionBatch'
+    const isScientificV2Rereview = action === 'adminBenchmarkControl'
+      && body.evaluationMode === 'codex_scientific_v2' && body.command === 'reviewOnly'
+    const expectedScientificOperation = isScientificV2Freeze ? 'freeze'
+      : isScientificV2RemediationFreeze ? 'remediate-freeze'
+        : isScientificV2ExpansionFreeze ? 'expansion-freeze' : isScientificV2Rereview ? 'rereview' : ''
+    if ((declaredScientificV2AdminOperation || isScientificV2Rereview || (isAdminTransport && (isScientificV2Freeze || isScientificV2RemediationFreeze || isScientificV2ExpansionFreeze)))
+      && !(declaredScientificV2AdminOperation === expectedScientificOperation
+        && gatewayTransport && isAdminTransport && Boolean(expectedScientificOperation))) {
+      return response.status(400).json({ code: 400, error: 'Scientific V2 admin transport rejected' })
+    }
+    if (isAdminTransport && config.adminToken && adminActions.has(action)) {
+      const adminUserId = safeLegacyHeader(request.get('x-paperbanana-admin-user-id'), 200) || ''
+      if (!/^[A-Za-z0-9._:-]{3,200}$/.test(adminUserId)) return response.status(401).json({ code: 401, error: 'Missing immutable admin identity' })
+      body.adminToken = config.adminToken
+      body.adminUserId = adminUserId
+    }
+    if (ADMIN_OPERATIONS_ACTIONS.includes(action)) {
+      response.setHeader('Cache-Control', 'no-store')
+      const isAdmin = Boolean(isAdminTransport && config.adminToken && body.adminToken === config.adminToken)
+      if (!isAdmin) return response.status(403).json({ code: 403, error: '需要管理员身份' })
+      if (!adminOperations) return response.status(503).json({ code: 503, error: '后台查询服务暂不可用' })
+      try { return response.json(await adminOperations.handle(body, isAdmin)) }
+      catch (error) {
+        const status = error instanceof AdminError ? error.status : 503
+        logger.warn('admin operations rejected', { action, status })
+        return response.status(status).json({ code: status, error: error instanceof AdminError ? error.message : '后台数据暂不可用，请稍后重试' })
+      }
+    }
+    if (benchmarkService && (action.startsWith('benchmark') || action.startsWith('adminBenchmark'))) {
+      try {
+        const isAdmin = Boolean(isAdminTransport && config.adminToken && body.adminToken === config.adminToken && adminActions.has(action))
+        if (action === 'adminBenchmarkControl' && body.command === 'prepareScientificV2Registry') {
+          if (!isAdmin) return response.status(200).send({ code: 401, error: 'Benchmark admin required' })
+          if (!prepareScientificV2RegistryAuthority) return response.status(200).send({ code: 400, error: 'Benchmark request rejected' })
+          return response.status(200).send({ code: 0, registryAuthority: await prepareScientificV2RegistryAuthority() })
+        }
+        return response.status(200).send(await benchmarkService.handle(body, isAdmin))
+      } catch (error) {
+        const message = String((error as Error)?.message || '')
+        const code = error instanceof AdminError ? error.status : message.startsWith('BENCHMARK_ADMIN_REQUIRED') || message.startsWith('BENCHMARK_PROMPT_LOGIN_REQUIRED')
+          ? 401
+          : message === 'ACCOUNT_DELETION_IN_PROGRESS' ? 409
+          : message.startsWith('BENCHMARK_PROMPT_RATE_LIMIT_') ? 429 : 400
+        logger.warn('benchmark request rejected', { action, code })
+        const scientificV2AdminDiagnostic = isAdminTransport
+          && body.evaluationMode === 'codex_scientific_v2'
+          && adminActions.has(action)
+          ? scientificV2AdminDiagnosticCode(error)
+          : ''
+        return response.status(200).json({
+          code,
+          error: error instanceof AdminError || message === 'ACCOUNT_DELETION_IN_PROGRESS' ? message : 'Benchmark request rejected',
+          ...(scientificV2AdminDiagnostic ? { diagnosticCode: scientificV2AdminDiagnostic } : {}),
+        })
+      }
+    }
+    const ctx: CoreContext = {
+      request: { method: request.method },
+      body,
+      headers: handlerHeaders(request),
+      response: {
+        setHeader(name, value) { response.setHeader(name, value) },
+        status(code) { response.status(code) },
+      },
+    }
+
+    try {
+      const result = await handler(ctx)
+      return response.status(200).send(result)
+    } catch (error) {
+      logger.error('Core handler failed', redactLogValue(error))
+      return response.status(500).json({ code: 500, error: 'Internal server error' })
+    }
+  }
+
+  app.get('/paperbanana-api', invokeLegacy)
+  app.post('/paperbanana-api', invokeLegacy)
+
+  app.use((error: unknown, _request: Request, response: Response, next: NextFunction) => {
+    if ((error as { type?: string })?.type === 'entity.too.large') {
+      return response.status(413).json({ code: 413, error: 'Request body too large' })
+    }
+    if ((error as { type?: string })?.type === 'entity.parse.failed') {
+      return response.status(400).json({ code: 400, error: 'Invalid JSON body' })
+    }
+    logger.error('request failed', redactLogValue(error))
+    if (response.headersSent) return next(error)
+    return response.status(500).json({ code: 500, error: 'Internal server error' })
+  })
+
+  return app
+}
+
+export function createServer(dependencies: AppDependencies): http.Server {
+  return http.createServer(createApp(dependencies))
+}

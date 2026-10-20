@@ -1,0 +1,10 @@
+{
+  "repository": "https://github.com/yrjmdqmmx/Tuyan",
+  "revision": "d8bc9a90732069233ed81ac9209de62fbfa9a9d1",
+  "productionBranch": "codex/hangzhou-production",
+  "purpose": "Isolated Tashan branch previews; production remains in Hangzhou.",
+  "handoff": {
+    "lineage_id": "lin-611beb1188a02984",
+    "parent_handoff_id": "20261019-092001-codex-tuyan-workspace-production-fixes-and-acc-01a14ce4-6069-76b0-96cb-"
+  }
+}

@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+bin/
+obj/
+out/
+release/
+coverage/
+artifacts/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# macOS
+.DS_Store
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+.project
+.classpath
+.settings/
+
+# Web and Electron caches
+.vite/
+.turbo/
+.cache/
+__pycache__/
+*.py[cod]
+
+# WeChat Developer Tools local overrides
+apps/miniprogram/project.private.config.json
+.gstack/

@@ -1,0 +1,17 @@
+{
+  "name": "tuyan-clients",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Tuyan Web and WeChat Mini Program monorepo",
+  "license": "Apache-2.0",
+  "packageManager": "pnpm@10.28.2",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "clean": "pnpm -r exec rm -rf node_modules dist build"
+  },
+  "devDependencies": {
+    "ajv": "8.17.1"
+  }
+}

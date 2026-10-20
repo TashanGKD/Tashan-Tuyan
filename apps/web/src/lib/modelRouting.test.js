@@ -1,0 +1,233 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+import {
+  arkProbesForRoles,
+  buildModelSubmission,
+  clearArkVerificationForRole,
+  DEFAULT_WEB_PROVIDER,
+  firstInvalidRequiredRoute,
+  missingArkVerifications,
+  nextArkVerificationBatch,
+  providerDefaultRoutes,
+  requiredCreateRouteRoles,
+  requiredRefineRouteRoles,
+  scopedApiKeysForRoles,
+  uniqueProvidersForRoles,
+} from './modelRouting.js'
+import { PROVIDERS } from '../constants.js'
+import { STATIC_MODEL_REGISTRY } from './staticModelCatalog.js'
+
+test('Web defaults submit the exact TokenDance Pro route before and after the live catalog arrives', () => {
+  assert.equal(DEFAULT_WEB_PROVIDER, 'tokendance')
+  for (const live of [null, { routeContractVersion: 1, providers: STATIC_MODEL_REGISTRY }]) {
+    const routes = providerDefaultRoutes(DEFAULT_WEB_PROVIDER, live, PROVIDERS)
+    assert.deepEqual(routes.image, { accessProvider: 'tokendance', modelId: 'seedream-5.0-pro' })
+    const submission = buildModelSubmission({ configurationMode: 'simple', modelRoutes: routes, registry: live })
+    assert.equal(submission.provider, 'tokendance')
+    assert.equal(submission.imageGenModelName, 'seedream-5.0-pro')
+  }
+  assert.equal(STATIC_MODEL_REGISTRY.tokendance.defaults.image, 'seedream-5.0-lite', 'Web does not mutate the shared catalog')
+})
+
+test('Web defaults respect live availability and explicit Lite selections remain unchanged', () => {
+  const live = { routeContractVersion: 1, providers: structuredClone(STATIC_MODEL_REGISTRY) }
+  const explicit = providerDefaultRoutes('tokendance', live, PROVIDERS)
+  explicit.image.modelId = 'seedream-5.0-lite'
+  assert.equal(buildModelSubmission({ configurationMode: 'advanced', modelRoutes: explicit, registry: live }).imageGenModelName, 'seedream-5.0-lite')
+  live.providers.tokendance.models.find(model => model.id === 'seedream-5.0-pro').selectable = false
+  assert.equal(providerDefaultRoutes('tokendance', live, PROVIDERS).image.modelId, 'seedream-5.0-lite')
+  live.providers.tokendance.models = live.providers.tokendance.models.filter(model => model.id !== 'seedream-5.0-pro')
+  assert.equal(providerDefaultRoutes('tokendance', live, PROVIDERS).image.modelId, 'seedream-5.0-lite')
+})
+
+const fallbackProviders = {
+  openai: { mainModel: 'fallback-main', imageModel: 'fallback-image', visionModel: 'fallback-vision' },
+  bailian: { mainModel: 'fallback-qwen', imageModel: 'fallback-wan', visionModel: 'fallback-vision-qwen' },
+}
+
+const registry = {
+  routeContractVersion: 1,
+  providers: {
+    openai: { defaults: { main: 'gpt-5.6-sol', image: 'gpt-image-2', vision: 'gpt-5.6-sol' } },
+    bailian: { defaults: { main: 'qwen3.8-max', image: 'wan2.7-image-pro', vision: 'qwen3.7-plus' } },
+    ark: { defaults: { main: 'doubao-text', image: 'doubao-image', vision: 'doubao-vision' } },
+  },
+}
+
+test('simple provider defaults produce one complete non-mixed route state', () => {
+  assert.deepEqual(providerDefaultRoutes('bailian', registry, fallbackProviders), {
+    main: { accessProvider: 'bailian', modelId: 'qwen3.8-max' },
+    image: { accessProvider: 'bailian', modelId: 'wan2.7-image-pro' },
+    vision: { accessProvider: 'bailian', modelId: 'qwen3.7-plus' },
+  })
+})
+
+test('ordinary presets prefer an available visual main within the selected channel, without mutating the catalog', () => {
+  const model = (id, roles, vision, selectable = true) => ({id, roles, selectable, capabilities: {referenceImages: vision}})
+  const base = {providers: {bailian: {
+    defaults: {main: 'text-main', image: 'image', vision: 'vision-default'},
+    models: [model('text-main', ['main'], false), model('vision-only', ['vision'], true),
+      model('disabled-main', ['main'], true, false), model('unknown-main', ['main'], undefined),
+      model('other-visual', ['main'], true), model('vision-default', ['main', 'vision'], true)],
+  }}}
+  const original = structuredClone(base)
+  assert.deepEqual(providerDefaultRoutes('bailian', base, fallbackProviders), {
+    main: {accessProvider: 'bailian', modelId: 'vision-default'},
+    image: {accessProvider: 'bailian', modelId: 'image'},
+    vision: {accessProvider: 'bailian', modelId: 'vision-default'},
+  })
+  assert.deepEqual(base, original)
+  base.providers.bailian.models[0].capabilities.referenceImages = true
+  assert.equal(providerDefaultRoutes('bailian', base, fallbackProviders).main.modelId, 'text-main')
+  base.providers.bailian.models[0].capabilities.referenceImages = false
+  base.providers.bailian.models.at(-1).selectable = false
+  assert.equal(providerDefaultRoutes('bailian', base, fallbackProviders).main.modelId, 'other-visual')
+  base.providers.bailian.models.find(entry => entry.id === 'other-visual').selectable = false
+  assert.equal(providerDefaultRoutes('bailian', base, fallbackProviders).main.modelId, 'text-main', 'unknown, unavailable and vision-only entries cannot replace the main model')
+})
+
+test('safe bootstrap uses current official defaults and Google user-facing naming', () => {
+  assert.equal(PROVIDERS.gemini.label, 'Google')
+  assert.deepEqual([
+    PROVIDERS.gemini.mainModel, PROVIDERS.gemini.imageModel, PROVIDERS.gemini.visionModel,
+  ], ['gemini-3.7-flash', 'gemini-3.1-flash-image', 'gemini-3.7-flash'])
+  assert.deepEqual([
+    PROVIDERS.openrouter.mainModel, PROVIDERS.openrouter.imageModel, PROVIDERS.openrouter.visionModel,
+  ], ['openai/gpt-5.6-sol', 'sourceful/riverflow-v2.5-pro', 'google/gemini-3.7-flash'])
+  assert.equal(PROVIDERS.bailian.visionModel, 'qwen3.7-plus')
+  assert.deepEqual([
+    PROVIDERS.ark.mainModel, PROVIDERS.ark.imageModel, PROVIDERS.ark.visionModel,
+  ], ['doubao-seed-2-1-pro-260628', 'doubao-seedream-5-0-pro-260628', 'doubao-seed-2-1-pro-260628'])
+  assert.match(PROVIDERS.ark.guideSteps.join(' '), /最低支持分辨率/)
+  assert.doesNotMatch(PROVIDERS.ark.guideSteps.join(' '), /一次 1K 调用/)
+})
+
+test('advanced submission keeps mixed routes and legacy fields aligned to each role', () => {
+  const routes = {
+    main: { accessProvider: 'openai', modelId: 'gpt-5.6-sol' },
+    image: { accessProvider: 'bailian', modelId: 'wan2.7-image-pro' },
+    vision: { accessProvider: 'ark', modelId: 'doubao-vision' },
+  }
+  assert.deepEqual(buildModelSubmission({ configurationMode: 'advanced', modelRoutes: routes, registry }), {
+    configurationMode: 'advanced',
+    provider: 'openai',
+    modelRoutes: routes,
+    mainModelName: 'gpt-5.6-sol',
+    imageGenModelName: 'wan2.7-image-pro',
+    referenceVisionModelName: 'doubao-vision',
+  })
+})
+
+test('old backends use simple legacy fallback and fail closed for advanced routes', () => {
+  const routes = providerDefaultRoutes('openai', null, fallbackProviders)
+  assert.deepEqual(buildModelSubmission({ configurationMode: 'simple', modelRoutes: routes, registry: null }), {
+    configurationMode: 'simple',
+    provider: 'openai',
+    mainModelName: 'fallback-main',
+    imageGenModelName: 'fallback-image',
+    referenceVisionModelName: 'fallback-vision',
+  })
+  assert.throws(
+    () => buildModelSubmission({ configurationMode: 'advanced', modelRoutes: routes, registry: { routeContractVersion: 0 } }),
+    /不支持专业模式/,
+  )
+})
+
+test('reachable create roles mirror Core route secret selection', () => {
+  assert.deepEqual(requiredCreateRouteRoles({ outputFormat: 'svg', retrievalSetting: 'none' }, 0), ['main'])
+  assert.deepEqual(requiredCreateRouteRoles({ outputFormat: 'png', pipelineMode: 'vanilla', retrievalSetting: 'none', imageSize: '1K' }, 1), ['main', 'image'])
+  assert.deepEqual(requiredCreateRouteRoles({ outputFormat: 'png', pipelineMode: 'planner_critic', retrievalSetting: 'auto', imageSize: '2K' }, 1), ['main', 'image', 'vision'])
+  assert.deepEqual(requiredCreateRouteRoles({ taskName: 'plot', outputFormat: 'svg', pipelineMode: 'planner_critic', imageSize: '1K' }, 1), ['main', 'vision'])
+})
+
+test('reachable refine roles distinguish direct edit from analyze and redraw', () => {
+  assert.deepEqual(requiredRefineRouteRoles({ refineMode: 'direct-edit' }), ['main', 'image', 'vision'])
+  assert.deepEqual(requiredRefineRouteRoles({ refineMode: 'analyze-redraw' }), ['main', 'image', 'vision'])
+})
+
+test('credential providers and payload keys cover only reachable deduplicated roles', () => {
+  const routes = {
+    main: { accessProvider: 'openai', modelId: 'main' },
+    image: { accessProvider: 'ark', modelId: 'image' },
+    vision: { accessProvider: 'openai', modelId: 'vision' },
+  }
+  assert.deepEqual(uniqueProvidersForRoles(routes, ['main', 'vision']), ['openai'])
+  assert.deepEqual(scopedApiKeysForRoles(routes, ['image'], { openai: 'unused', ark: 'ark-key', bailian: 'unused' }), { ark: 'ark-key' })
+})
+
+test('Ark inference probes and submit gate cover only reachable exact selected routes', () => {
+  const routes = {
+    main: { accessProvider: 'ark', modelId: 'doubao-text' },
+    image: { accessProvider: 'openai', modelId: 'gpt-image-2' },
+    vision: { accessProvider: 'ark', modelId: 'doubao-vision' },
+  }
+  const probes = arkProbesForRoles(routes, ['main', 'image', 'vision'])
+  assert.deepEqual(probes, [
+    { role: 'main', modelId: 'doubao-text' },
+    { role: 'vision', modelId: 'doubao-vision' },
+  ])
+  assert.deepEqual(missingArkVerifications(probes, {
+    'main:doubao-text': 'verified',
+    'vision:doubao-vision': 'failed',
+  }), [{ role: 'vision', modelId: 'doubao-vision' }])
+})
+
+test('changing one route clears only that role Ark verification', () => {
+  assert.deepEqual(clearArkVerificationForRole({
+    'main:doubao-text': 'verified',
+    'image:doubao-image': 'verified',
+    'vision:doubao-vision': 'verified',
+  }, 'image'), {
+    'main:doubao-text': 'verified',
+    'vision:doubao-vision': 'verified',
+  })
+})
+
+test('Ark verification always finishes free roles before a separately confirmed image probe', () => {
+  const probes = [
+    { role: 'main', modelId: 'doubao-text' },
+    { role: 'image', modelId: 'doubao-image' },
+    { role: 'vision', modelId: 'doubao-vision' },
+  ]
+  assert.deepEqual(nextArkVerificationBatch(probes, {}, true), {
+    probes: [probes[0], probes[2]],
+    confirmPaidImageProbe: false,
+  })
+  assert.deepEqual(nextArkVerificationBatch(probes, {
+    'main:doubao-text': 'verified',
+    'vision:doubao-vision': 'verified',
+  }, true), {
+    probes: [probes[1]],
+    confirmPaidImageProbe: true,
+  })
+})
+
+test('unused route drafts cannot block actual execution', () => {
+  const entries = {
+    main: { id: 'main', roles: ['main'], selectable: true },
+    image: { id: 'image', roles: ['vision'], selectable: false, selectionDisabledReason: '图像权益未开通' },
+    vision: { id: 'vision', roles: ['vision'], selectable: true },
+  }
+  assert.equal(firstInvalidRequiredRoute({ roles: ['main'], entries, outputFormat: 'svg' }), null)
+})
+
+test('unreachable image route still needs registry role capability but not the current output format', () => {
+  const entries = {
+    main: { id: 'main', roles: ['main'], selectable: true },
+    image: { id: 'image', roles: ['image'], selectable: true, capabilities: { outputFormats: ['png'] } },
+    vision: { id: 'vision', roles: ['vision'], selectable: true },
+  }
+  assert.equal(firstInvalidRequiredRoute({ roles: ['main'], entries, outputFormat: 'svg' }), null)
+  assert.deepEqual(firstInvalidRequiredRoute({ roles: ['image'], entries, outputFormat: 'svg' }), {
+    setting: 'image-model',
+    message: '当前图像模型不支持 SVG 输出。',
+  })
+})
+
+test('MiniMax China is explicit routing data and cannot be submitted to an older backend', () => {
+  const modelRoutes = {main:{accessProvider:'minimax',modelId:'MiniMax-M3'},image:{accessProvider:'minimax',modelId:'image-01'},vision:{accessProvider:'minimax',modelId:'MiniMax-M3'}}
+  const input = {configurationMode:'simple', modelRoutes, providerRegions:{minimax:'cn'}, registry:{routeContractVersion:1,providerRegionContractVersion:1}}
+  assert.deepEqual(buildModelSubmission(input).providerRegions,{minimax:'cn'})
+  assert.throws(()=>buildModelSubmission({...input,registry:{routeContractVersion:1}}),/稀宇科技国内区域/)
+})

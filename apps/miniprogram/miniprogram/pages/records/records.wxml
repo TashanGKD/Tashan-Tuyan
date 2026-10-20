@@ -1,0 +1,166 @@
+<scroll-view class="page" scroll-y type="list">
+  <auth-panel show="{{showAuthPanel}}" bind:close="closeAuthPanel" bind:authed="onAuthed" />
+
+  <view class="section records-panel">
+    <view class="section-head">
+      <view>
+        <view class="section-title">我的任务记录</view>
+        <view class="section-note">任务记录与账号绑定，登录后可以查看自己提交过的任务。</view>
+      </view>
+      <view class="records-head-actions" wx:if="{{isLoggedIn}}"><button class="ghost-button" size="mini" bindtap="openAccountSettings">账户设置</button><button class="ghost-button" size="mini" bindtap="refreshAccountJobs">刷新</button></view>
+    </view>
+
+    <view class="login-required-card" wx:if="{{isAuthChecking}}">
+      <view class="login-card-title">正在检查登录状态</view>
+      <view class="login-card-note">请稍候。</view>
+    </view>
+
+    <view class="login-required-card" wx:elif="{{!isLoggedIn}}">
+      <view class="login-card-title">任务记录需要登录后使用</view>
+      <view class="login-card-note">不登录也可以正常生成候选图；登录后，新提交的任务会保存到你的账号记录里。</view>
+      <button class="login-card-button" bindtap="openAuthPanel">登录 / 注册</button>
+    </view>
+
+    <block wx:else>
+      <view class="account-row">
+        <text>{{currentUserEmail}}</text>
+        <button class="ghost-button" size="mini" bindtap="signOut">退出</button>
+      </view>
+      <view wx:if="{{accountJobsLoading}}" class="empty-state">正在加载任务记录</view>
+      <view wx:if="{{accountJobsError}}" class="error-box">{{accountJobsError}}</view>
+      <view wx:if="{{!accountJobsLoading && !accountJobs.length}}" class="empty-state">
+        <view>暂无任务记录</view>
+        <text>登录后提交的新任务会出现在这里。</text>
+      </view>
+      <view class="job-record-card" wx:for="{{accountJobs}}" wx:key="id">
+        <view class="job-record-topline">
+          <view class="history-status {{item.status}}">{{item.job_type === 'refine' ? '精修 · ' : ''}}{{item.status_text}}</view>
+          <view class="job-record-time">{{item.created_text}}</view>
+        </view>
+        <view class="job-record-title">{{item.caption || '未记录图注'}}</view>
+        <view class="job-record-meta">
+          <view><text>任务来源</text><text>{{item.client_platform_text}}</text></view>
+          <view><text>类别</text><text>{{item.infographic_category}}</text></view>
+          <view><text>配置模式</text><text>{{item.configuration_mode === 'simple' ? '普通模式' : '专业模式'}}</text></view>
+          <view><text>任务类型</text><text>{{item.task_name === 'plot' ? '统计图' : '结构图'}}</text></view>
+          <view><text>格式 / 清晰度</text><text>{{item.output_format_text}} · {{item.image_size || '自动'}}</text></view>
+          <view><text>比例</text><text>{{item.aspect_ratio || '自动'}}</text></view>
+          <view><text>路由范围</text><text>{{item.routing_mode === 'mixed' ? '跨渠道' : (item.routing_mode === 'single' ? '单渠道' : '未记录')}}</text></view>
+          <view><text>路由来源</text><text>{{item.model_routing_source === 'explicit' ? '显式路由' : (item.model_routing_source === 'legacy-derived' ? '兼容旧任务' : '未记录')}}</text></view>
+          <view><text>检索</text><text>{{item.retrieval_setting_text || '不使用检索'}}</text></view>
+        </view>
+        <view class="job-models">
+          <view>
+            <text>主模型</text>
+            <text>{{item.model_routes.main.accessProvider || item.provider || '模型服务'}} · {{item.main_model_name || '未记录'}}</text>
+          </view>
+          <view>
+            <text>图像模型</text>
+            <text>{{item.model_routes.image.accessProvider || item.provider || '模型服务'}} · {{item.image_gen_model_name || '未记录'}}</text>
+          </view>
+          <view>
+            <text>导出格式</text>
+            <text>{{item.output_format_text}}</text>
+          </view>
+          <view>
+            <text>参考识别模型</text>
+            <text>{{item.model_routes.vision.accessProvider || item.provider || '模型服务'}} · {{item.reference_vision_model_text}}</text>
+          </view>
+          <view>
+            <text>参考图处理</text>
+            <text>{{item.reference_image_mode_text}}</text>
+          </view>
+        </view>
+        <view class="job-prompt-preview"><text class="prompt-label">方法内容</text><text>{{item.method_content || item.method_preview || '未记录方法内容'}}</text></view>
+        <view class="job-prompt-preview" wx:if="{{item.negative_prompt}}"><text class="prompt-label">负向提示词</text><text>{{item.negative_prompt}}</text></view>
+        <view class="job-record-error" wx:if="{{item.error}}">{{item.error}}</view>
+        <view class="record-asset-section" wx:if="{{item.reference_images.length}}">
+          <view class="record-asset-title">参考图</view>
+          <view class="record-images">
+            <view class="record-asset-card" wx:for="{{item.reference_images}}" wx:for-item="image" wx:key="url">
+              <image
+                wx:if="{{image.can_preview}}"
+                class="record-reference-image"
+                src="{{image.url}}"
+                mode="aspectFill"
+                data-url="{{image.url}}"
+                data-can-preview="{{image.can_preview}}"
+                bindtap="previewRecordImage"
+              />
+              <view
+                wx:else
+                class="file-asset compact"
+                data-url="{{image.url}}"
+                data-can-preview="{{image.can_preview}}"
+                bindtap="previewRecordImage"
+              >
+                <view class="file-asset-format">{{image.format_text}}</view>
+                <view class="file-asset-name">{{image.filename}}</view>
+              </view>
+              <button
+                size="mini"
+                data-url="{{image.url}}"
+                data-can-preview="{{image.can_preview}}"
+                catchtap="handleImageAction"
+              >
+                {{image.action_label}}
+              </button>
+            </view>
+          </view>
+        </view>
+        <view class="record-images" wx:if="{{item.result_images.length}}">
+          <view class="record-asset-card result" wx:for="{{item.result_images}}" wx:for-item="image" wx:key="url">
+            <image
+              wx:if="{{image.can_preview}}"
+              class="record-result-image"
+              src="{{image.url}}"
+              mode="widthFix"
+              data-url="{{image.url}}"
+              data-can-preview="{{image.can_preview}}"
+              bindtap="previewRecordImage"
+            />
+            <view
+              wx:else
+              class="file-asset compact"
+              data-url="{{image.url}}"
+              data-can-preview="{{image.can_preview}}"
+              bindtap="previewRecordImage"
+            >
+              <view class="file-asset-format">{{image.format_text}}</view>
+              <view class="file-asset-name">{{image.filename}}</view>
+            </view>
+            <button
+              size="mini"
+              data-url="{{image.url}}"
+              data-can-preview="{{image.can_preview}}"
+              catchtap="handleImageAction"
+            >
+              {{image.action_label}}
+            </button>
+          </view>
+        </view>
+        <view class="record-actions"><button class="secondary-button" data-id="{{item.id}}" bindtap="openJob">查看完整详情</button><button class="secondary-button" wx:if="{{item.result_images.length}}" bindtap="openRefine">精修结果图</button></view>
+      </view>
+    </block>
+  </view>
+
+  <view class="section" wx:if="{{localJobs.length}}">
+    <view class="section-head">
+      <view>
+        <view class="section-title">本机最近</view>
+        <view class="section-note">保存在当前设备，换设备后不会同步。</view>
+      </view>
+      <button class="ghost-button" size="mini" bindtap="clearLocal">清空</button>
+    </view>
+    <view class="history-item" wx:for="{{localJobs}}" wx:key="id" data-id="{{item.id}}" bindtap="openJob">
+      <view class="history-main">
+        <view class="history-title">{{item.caption || item.id}}</view>
+        <view class="history-meta">任务来源：{{item.client_platform_text}} · {{item.infographic_category}} · {{item.provider || '模型服务'}}</view>
+      </view>
+      <view class="history-status {{item.status}}">{{item.job_type === 'refine' ? '精修 · ' : ''}}{{item.status_text}}</view>
+    </view>
+  </view>
+
+  <view class="footer-space" />
+</scroll-view>
+<account-settings show="{{showAccountSettings}}" current-email="{{currentUserEmail}}" email-verified="{{currentUserEmailVerified}}" bind:close="closeAccountSettings" bind:signedout="onAccountSignedOut" bind:deleted="onAccountDeleted" />

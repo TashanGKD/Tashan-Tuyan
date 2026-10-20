@@ -1,0 +1,888 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+test('uploaded refinement source serializes only its object key and marks finalize purpose explicitly', async () => {
+  const mock = mockJsonFetch(() => ({ code: 0, jobId: 'refine-upload', status: 'queued', source: { width: 120, height: 80 } }));
+  try {
+    await refineImageRequest('https://gateway.example', { backendMode: 'gateway' }, {
+      sourceImageUpload: { objectKey: 'references/owner/source.png', userId: 'forged-owner', uploadToken: 'must-not-copy' },
+      editInstruction: '放大标签', imageSize: '1K', aspectRatio: '1:1',
+    });
+    assert.deepEqual(JSON.parse(mock.calls[0].options.body).sourceImageUpload, { objectKey: 'references/owner/source.png' });
+    await refineImageRequest('https://gateway.example', {backendMode:'gateway'}, {sourceImageUpload:{materialId:'material-1',objectKey:'forged/path.png',userId:'forged-owner'},materialFiles:[{id:'auxiliary-1'}],editInstruction:'Use source and auxiliary original'});
+    assert.deepEqual(JSON.parse(mock.calls[1].options.body).sourceImageUpload,{materialId:'material-1'});
+    assert.deepEqual(JSON.parse(mock.calls[1].options.body).materialFiles,[{id:'auxiliary-1'}]);
+    const result = await finalizeReferenceUploadRequest('https://gateway.example', { backendMode: 'gateway' }, [], { purpose: 'refine' });
+    assert.equal(JSON.parse(mock.calls[2].options.body).purpose, 'refine');
+    assert.deepEqual(result.source, { width: 120, height: 80 });
+  } finally { mock.restore(); }
+});
+
+import {
+  createJobRequest,
+  adminJobsRequest,
+  abortReferenceUploadRequest,
+  finalizeReferenceUploadRequest,
+  formatClientPlatform,
+  getJobRequest,
+  modelRegistryRequest,
+  fetchBackendHealth,
+  benchmarkLeaderboardRequest,
+  benchmarkCaseEvidenceRequest,
+  benchmarkModelProfileRequest,
+  benchmarkMethodologyRequest,
+  benchmarkPromptSubmissionRequest,
+  adminBenchmarkRequest,
+  providerAccountCatalogRequest,
+  referenceLibraryRequest,
+  refineImageRequest,
+  optimizeInputsRequest,
+  userJobsRequest,
+} from './jobs.js';
+
+function mockJsonFetch(handler) {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options = {}) => {
+    calls.push({ url, options });
+    const payload = await handler(url, options, calls.length - 1);
+    return {
+      ok: payload.ok ?? true,
+      status: payload.status || 200,
+      text: async () => JSON.stringify(payload.body ?? payload),
+    };
+  };
+  return {
+    calls,
+    restore() {
+      globalThis.fetch = originalFetch;
+    },
+  };
+}
+
+test('createJobRequest sends retrieval and task fields to gateway', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: { code: 0, jobId: 'job-1', status: 'queued' } }));
+  try {
+    const result = await createJobRequest('https://gateway.example', { backendMode: 'gateway' }, {
+      configurationMode: 'advanced',
+      provider: 'bailian',
+      apiKeys: { bailian: 'key' },
+      taskName: 'diagram',
+      methodContent: 'A sufficiently long method section for testing.',
+      caption: 'Figure 1',
+      infographicCategory: '方法框架图',
+      outputFormat: 'png',
+      mainModelName: 'qwen-plus',
+      imageGenModelName: 'wanx2.1-t2i-plus',
+      referenceVisionModelName: 'qwen-vl-plus',
+      referenceImageMode: 'auto',
+      referenceImages: [],
+      pipelineMode: 'demo_full',
+      retrievalSetting: 'manual',
+      manualReferenceIds: ['diagram-001', 'diagram-002'],
+      aspectRatio: '16:9',
+      numCandidates: 2,
+      maxCriticRounds: 1,
+    });
+
+    assert.deepEqual(result, { id: 'job-1', status: 'queued' });
+    const body = JSON.parse(fetchMock.calls[0].options.body);
+    assert.equal(body.action, 'createJob');
+    assert.equal(body.clientPlatform, 'web');
+    assert.equal(body.taskName, 'diagram');
+    assert.equal(body.pipelineMode, 'full');
+    assert.equal(body.retrievalSetting, 'manual');
+    assert.deepEqual(body.manualReferenceIds, ['diagram-001', 'diagram-002']);
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('createJobRequest preserves canonical full and legacy full aliases through the shared adapter', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: { code: 0, jobId: 'full-flow', status: 'queued' } }));
+  try {
+    for (const pipelineMode of ['full', 'demo_full', 'planner_critic', 'demo_planner_critic', 'vanilla']) {
+      await createJobRequest('https://gateway.example', { backendMode: 'gateway' }, { pipelineMode });
+      const actual = JSON.parse(fetchMock.calls.at(-1).options.body).pipelineMode;
+      assert.equal(actual, pipelineMode.replace(/^demo_/, ''));
+    }
+  } finally { fetchMock.restore(); }
+});
+
+test('createJobRequest sends negative prompt through the gateway and rejects retired transports', async () => {
+  const fetchMock = mockJsonFetch((_url, _options, index) => ({
+    body: index === 0
+      ? { code: 0, jobId: 'gateway-negative', status: 'queued' }
+      : { id: 'fast-negative', status: 'queued' },
+  }));
+  const payload = {
+    provider: 'openai',
+    apiKeys: { openai: 'key' },
+    taskName: 'diagram',
+    methodContent: 'A sufficiently long method section for testing.',
+    negativePrompt: 'Avoid gradients and decorative shadows.',
+    caption: 'Figure 1',
+    mainModelName: 'gpt-5.6-sol',
+    imageGenModelName: 'gpt-image-2',
+  };
+  try {
+    await createJobRequest('https://gateway.example', { backendMode: 'gateway' }, payload);
+    await assert.rejects(createJobRequest('https://fast.example', { backendMode: 'fastapi' }, payload), /认证网关/);
+
+    const gatewayBody = JSON.parse(fetchMock.calls[0].options.body);
+    assert.equal(fetchMock.calls.length, 1);
+    assert.equal(gatewayBody.negativePrompt, payload.negativePrompt);
+    assert.equal('negative_prompt' in gatewayBody, false);
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('optimizeInputsRequest sends only the selected main route and key without mutating the payload', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: {
+    code: 0,
+    target: 'caption',
+    optimizedText: 'A concise caption for the proposed method.',
+  } }));
+  const payload = {
+    target: 'caption',
+    inputs: {
+      methodContent: 'We propose a structured visual generation workflow.',
+      caption: 'Proposed workflow.',
+      negativePrompt: 'Avoid decorative gradients.',
+    },
+    mainRoute: { accessProvider: 'openai', modelId: 'gpt-5.6-sol' },
+    apiKey: 'openai-key',
+    clientPlatform: 'web',
+    modelRoutes: {
+      main: { accessProvider: 'openai', modelId: 'gpt-5.6-sol' },
+      image: { accessProvider: 'bailian', modelId: 'wan2.7-image-pro' },
+      vision: { accessProvider: 'gemini', modelId: 'gemini-3.7-flash' },
+    },
+    apiKeys: { openai: 'openai-key', bailian: 'bailian-key', gemini: 'gemini-key' },
+    imageRoute: { accessProvider: 'bailian', modelId: 'wan2.7-image-pro' },
+    visionRoute: { accessProvider: 'gemini', modelId: 'gemini-3.7-flash' },
+  };
+  const payloadSnapshot = structuredClone(payload);
+  try {
+    const result = await optimizeInputsRequest('https://gateway.example', { backendMode: 'gateway' }, payload);
+
+    assert.deepEqual(result, {
+      target: 'caption',
+      optimizedText: 'A concise caption for the proposed method.',
+    });
+    assert.equal(fetchMock.calls.length, 1);
+    assert.equal(fetchMock.calls[0].url, 'https://gateway.example/paperbanana-api');
+    assert.equal(fetchMock.calls[0].options.method, 'POST');
+    assert.equal(fetchMock.calls[0].options.headers['Content-Type'], 'application/json');
+    assert.deepEqual(JSON.parse(fetchMock.calls[0].options.body), {
+      action: 'optimizeInputs',
+      target: 'caption',
+      inputs: payload.inputs,
+      mainRoute: payload.mainRoute,
+      apiKey: 'openai-key',
+    });
+    assert.deepEqual(payload, payloadSnapshot);
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('optimizeInputsRequest rejects legacy backends', async () => {
+  await assert.rejects(
+    optimizeInputsRequest('https://fast.example', { backendMode: 'fastapi' }, {}),
+    /请使用图研认证网关。/,
+  );
+});
+
+test('getJobRequest normalizes negative prompt to canonical snake case and a camel alias', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: {
+    code: 0,
+    job: { _id: 'job-negative', negativePrompt: 'Avoid gradients.' },
+  } }));
+  try {
+    const job = await getJobRequest('https://gateway.example/paperbanana-api', { backendMode: 'gateway' }, 'job-negative');
+    assert.equal(job.negative_prompt, 'Avoid gradients.');
+    assert.equal(job.negativePrompt, 'Avoid gradients.');
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('getJobRequest normalizes PaperBanana parity fields', async () => {
+  const fetchMock = mockJsonFetch(() => ({
+    body: {
+      code: 0,
+      job: {
+        _id: 'job-2',
+        client_platform: 'miniprogram',
+        status: 'succeeded',
+        taskName: 'diagram',
+        retrievalSetting: 'auto',
+        retrievedReferenceIds: ['ref-a'],
+        retrievedReferences: [{ id: 'ref-a', title: 'Reference A', imageUrl: 'https://example.com/ref.png' }],
+        criticMode: 'image',
+        imageRefineMode: 'direct-edit',
+        imageRefineReason: 'Image model accepts a source image.',
+        refineMode: 'direct-edit',
+        refineReason: 'Refine used source pixels.',
+        stages: [
+          { id: 'stage-1', candidateId: 0, type: 'planner', title: 'Planner', text: 'plan' },
+          { id: 'stage-2', candidateId: 0, type: 'critic', round: 1, text: 'revise spacing' },
+        ],
+        resultImages: [{ filename: 'candidate.png', url: 'data:image/png;base64,AAAA', candidateId: 0, objectKey: 'jobs/job-2/result/candidate.png' }],
+      },
+    },
+  }));
+  try {
+    const job = await getJobRequest('https://gateway.example/paperbanana-api', { backendMode: 'gateway' }, 'job-2');
+    assert.equal(job.client_platform, 'miniprogram');
+    assert.equal(job.clientPlatform, 'miniprogram');
+    assert.equal(job.task_name, 'diagram');
+    assert.equal(job.retrieval_setting, 'auto');
+    assert.deepEqual(job.retrieved_reference_ids, ['ref-a']);
+    assert.equal(job.retrieved_references[0].id, 'ref-a');
+    assert.equal(job.critic_mode, 'image');
+    assert.equal(job.image_refine_mode, 'direct-edit');
+    assert.equal(job.image_refine_reason, 'Image model accepts a source image.');
+    assert.equal(job.refine_mode, 'direct-edit');
+    assert.equal(job.refine_reason, 'Refine used source pixels.');
+    assert.equal(job.stages.length, 2);
+    assert.equal(job.stages[1].type, 'critic');
+    assert.equal(job.result_images[0].object_key, 'jobs/job-2/result/candidate.png');
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('getJobRequest preserves Core routing metadata in camel and snake forms without deriving routes', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: {
+    code: 0,
+    job: {
+      _id: 'job-routed',
+      model_routes: {
+        main: { accessProvider: ' openai ', modelId: ' gpt-5.6-sol ' },
+        image: { accessProvider: 'bailian', modelId: 'wan2.7-image-pro' },
+        vision: { accessProvider: 'gemini', modelId: 'gemini-3.7-flash' },
+        ignored: { accessProvider: 'ark', modelId: 'should-not-leak' },
+      },
+      routing_mode: 'mixed',
+      model_routing_version: 1,
+      model_routing_source: 'explicit',
+    },
+  } }));
+  try {
+    const job = await getJobRequest('https://gateway.example/paperbanana-api', { backendMode: 'gateway' }, 'job-routed');
+    const expectedRoutes = {
+      main: { accessProvider: 'openai', modelId: 'gpt-5.6-sol' },
+      image: { accessProvider: 'bailian', modelId: 'wan2.7-image-pro' },
+      vision: { accessProvider: 'gemini', modelId: 'gemini-3.7-flash' },
+    };
+    assert.deepEqual(job.modelRoutes, expectedRoutes);
+    assert.deepEqual(job.model_routes, expectedRoutes);
+    assert.equal(job.routingMode, 'mixed');
+    assert.equal(job.routing_mode, 'mixed');
+    assert.equal(job.modelRoutingVersion, 1);
+    assert.equal(job.model_routing_version, 1);
+    assert.equal(job.modelRoutingSource, 'explicit');
+    assert.equal(job.model_routing_source, 'explicit');
+    assert.equal(job.provider, undefined);
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('getJobRequest treats a missing historical configuration mode as simple', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: {
+    code: 0,
+    job: { _id: 'legacy-simple-job', status: 'succeeded' },
+  } }));
+  try {
+    const job = await getJobRequest('https://gateway.example/paperbanana-api', { backendMode: 'gateway' }, 'legacy-simple-job');
+    assert.equal(job.configuration_mode, 'simple');
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('refineImageRequest sends image edit payload to gateway', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: {
+    code: 0,
+    jobId: 'refine-1',
+    status: 'queued',
+    refineCapability: { mode: 'direct-edit', directEdit: true, reason: 'Model accepts the source image.' },
+  } }));
+  try {
+    const result = await refineImageRequest('https://gateway.example', { backendMode: 'gateway' }, {
+      provider: 'openai',
+      apiKeys: { openai: 'key' },
+      imageModelName: 'gpt-image-1',
+      sourceImageUrl: 'https://example.com/source.png',
+      editInstruction: 'Make the labels larger.',
+      aspectRatio: '16:9',
+      imageSize: '2K',
+    });
+
+    assert.deepEqual(result, {
+      id: 'refine-1',
+      status: 'queued',
+      refineCapability: { mode: 'direct-edit', directEdit: true, reason: 'Model accepts the source image.' },
+    });
+    const body = JSON.parse(fetchMock.calls[0].options.body);
+    assert.equal(body.action, 'refineImage');
+    assert.equal(body.clientPlatform, 'web');
+    assert.equal(body.sourceImageUrl, 'https://example.com/source.png');
+    assert.equal(body.editInstruction, 'Make the labels larger.');
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('job requests forward explicit multi-provider model routes unchanged with the main provider shadow', async () => {
+  const fetchMock = mockJsonFetch((_url, _options, index) => ({ body: {
+    code: 0,
+    jobId: index === 0 ? 'create-routed' : 'refine-routed',
+    status: 'queued',
+  } }));
+  const modelRoutes = {
+    main: { accessProvider: 'openai', modelId: 'gpt-5.6-sol' },
+    image: { accessProvider: 'bailian', modelId: 'wan2.7-image-pro' },
+    vision: { accessProvider: 'gemini', modelId: 'gemini-3.7-flash' },
+  };
+  try {
+    await createJobRequest('https://gateway.example', { backendMode: 'gateway' }, {
+      configurationMode: 'advanced',
+      provider: 'openai',
+      apiKeys: { openai: 'openai-key', bailian: 'bailian-key', gemini: 'gemini-key' },
+      modelRoutes,
+      taskName: 'diagram',
+      methodContent: 'A sufficiently long method section for the routing transport test.',
+      caption: 'Figure 1',
+      infographicCategory: '方法框架图',
+      outputFormat: 'png',
+      imageSize: '2K',
+      mainModelName: 'gpt-5.6-sol',
+      imageGenModelName: 'wan2.7-image-pro',
+      referenceVisionModelName: 'gemini-3.7-flash',
+      referenceImageMode: 'auto',
+      pipelineMode: 'planner_critic',
+      retrievalSetting: 'none',
+      aspectRatio: '16:9',
+      numCandidates: 1,
+      maxCriticRounds: 1,
+    });
+    await refineImageRequest('https://gateway.example', { backendMode: 'gateway' }, {
+      configurationMode: 'advanced',
+      provider: 'openai',
+      apiKeys: { openai: 'openai-key', bailian: 'bailian-key', gemini: 'gemini-key' },
+      modelRoutes,
+      mainModelName: 'gpt-5.6-sol',
+      imageModelName: 'wan2.7-image-pro',
+      referenceVisionModelName: 'gemini-3.7-flash',
+      sourceImageObjectKey: 'jobs/source/result.png',
+      editInstruction: 'Make the labels larger.',
+      aspectRatio: '16:9',
+      imageSize: '2K',
+    });
+
+    for (const call of fetchMock.calls) {
+      const body = JSON.parse(call.options.body);
+      assert.equal(body.configurationMode, 'advanced');
+      assert.equal(body.provider, 'openai');
+      assert.deepEqual(body.modelRoutes, modelRoutes);
+      assert.equal(body.mainModelName, 'gpt-5.6-sol');
+      assert.equal(body.imageModelName, 'wan2.7-image-pro');
+      assert.equal(body.referenceVisionModelName, 'gemini-3.7-flash');
+      assert.notEqual(body.provider, 'mixed');
+    }
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('providerAccountCatalogRequest sends only explicit bounded Ark inference probes', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: {
+    code: 0,
+    provider: 'ark',
+    accountCatalogAvailable: false,
+    catalogAuth: 'access-key-required',
+    verificationMode: 'inference-smoke',
+    providerRegistry: { accessKind: 'aggregator', models: [] },
+    probeResults: [{ role: 'main', modelId: 'doubao-seed-2-0-mini-260428', state: 'verified' }],
+  } }));
+  try {
+    const result = await providerAccountCatalogRequest('https://gateway.example', { backendMode: 'gateway' }, {
+      provider: 'ark',
+      apiKeys: { ark: 'ark-secret' },
+      probes: [{ role: 'main', modelId: 'doubao-seed-2-0-mini-260428' }],
+      confirmPaidImageProbe: false,
+    });
+
+    const body = JSON.parse(fetchMock.calls[0].options.body);
+    assert.deepEqual(body, {
+      action: 'providerAccountCatalog',
+      provider: 'ark',
+      apiKeys: { ark: 'ark-secret' },
+      probes: [{ role: 'main', modelId: 'doubao-seed-2-0-mini-260428' }],
+      confirmPaidImageProbe: false,
+    });
+    assert.equal(result.accountCatalogAvailable, false);
+    assert.equal(result.catalogAuth, 'access-key-required');
+    assert.equal(result.verificationMode, 'inference-smoke');
+    assert.equal(result.probeResults[0].state, 'verified');
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('providerAccountCatalogRequest rejects non-Ark and over-broad probes before transport', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: { code: 0 } }));
+  try {
+    await assert.rejects(
+      providerAccountCatalogRequest('https://gateway.example', { backendMode: 'gateway' }, {
+        provider: 'bailian', apiKeys: { bailian: 'key' }, probes: [],
+      }),
+      /Ark/,
+    );
+    await assert.rejects(
+      providerAccountCatalogRequest('https://gateway.example', { backendMode: 'gateway' }, {
+        provider: 'ark', apiKeys: { ark: 'key' }, probes: [
+          { role: 'main', modelId: 'one' },
+          { role: 'image', modelId: 'two' },
+          { role: 'vision', modelId: 'three' },
+          { role: 'main', modelId: 'four' },
+        ],
+      }),
+      /3/,
+    );
+    assert.equal(fetchMock.calls.length, 0);
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('referenceLibraryRequest preserves English search copy and Chinese display copy', async () => {
+  const fetchMock = mockJsonFetch(() => ({
+    body: {
+      code: 0,
+      references: [{
+        id: 'ref_1',
+        title: 'English searchable title',
+        summary: 'English searchable summary',
+        titleZh: '中文标题',
+        introZh: '中文简介',
+        shortIntroZh: '中文短介绍',
+        detailZh: '中文详细说明，展示具体的数据和视觉关系。',
+        visualCategory: '方法框架图',
+        researchDomain: '计算机视觉',
+        keywords: ['数据流', '视觉模块'],
+        corpusVersion: 'zh-CN.v2',
+      }],
+      totalItems: '306',
+      totalPages: '26',
+      page: '2',
+      pageSize: '12',
+      facets: {
+        visualCategories: [{ value: '方法框架图', count: '66' }],
+        researchDomains: [{ value: '计算机视觉', count: '42' }],
+      },
+      corpusVersion: 'zh-CN.v2',
+    },
+  }));
+  try {
+    const result = await referenceLibraryRequest(
+      'https://gateway.example',
+      { backendMode: 'gateway' },
+      {
+        scope: 'bench', page: 2, pageSize: 12, query: 'vision',
+        visualCategory: '方法框架图', researchDomain: '计算机视觉', taskName: 'diagram',
+      },
+    );
+    assert.deepEqual(result.references[0], {
+      id: 'ref_1',
+      task_name: 'diagram',
+      title: 'English searchable title',
+      summary: 'English searchable summary',
+      titleZh: '中文标题',
+      introZh: '中文简介',
+      shortIntroZh: '中文短介绍',
+      detailZh: '中文详细说明，展示具体的数据和视觉关系。',
+      visualCategory: '方法框架图',
+      researchDomain: '计算机视觉',
+      keywords: ['数据流', '视觉模块'],
+      corpusVersion: 'zh-CN.v2',
+      image_url: '',
+      image_object_key: '',
+      source: 'paperbanana-bench',
+    });
+    assert.deepEqual(result, {
+      references: [result.references[0]],
+      totalItems: 306,
+      totalPages: 26,
+      page: 2,
+      pageSize: 12,
+      facets: {
+        visualCategories: [{ value: '方法框架图', count: 66 }],
+        researchDomains: [{ value: '计算机视觉', count: 42 }],
+      },
+      corpusVersion: 'zh-CN.v2',
+    });
+    assert.deepEqual(JSON.parse(fetchMock.calls[0].options.body), {
+      action: 'referenceLibrary',
+      scope: 'bench',
+      page: 2,
+      pageSize: 12,
+      query: 'vision',
+      visualCategory: '方法框架图',
+      researchDomain: '计算机视觉',
+      taskName: 'diagram',
+    });
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('referenceLibraryRequest normalizes legacy reference-only responses with default pagination', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: { code: 0, references: [{ id: 'ref_1' }] } }));
+  try {
+    const result = await referenceLibraryRequest(
+      'https://gateway.example',
+      { backendMode: 'gateway' },
+      { taskName: 'plot', limit: 24 },
+    );
+    assert.equal(result.totalItems, 1);
+    assert.equal(result.totalPages, 1);
+    assert.equal(result.page, 1);
+    assert.equal(result.pageSize, 24);
+    assert.deepEqual(result.facets, { visualCategories: [], researchDomains: [] });
+    assert.equal(result.corpusVersion, '');
+    assert.deepEqual(JSON.parse(fetchMock.calls[0].options.body), {
+      action: 'referenceLibrary', taskName: 'plot', query: '', limit: 24,
+    });
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('referenceLibraryRequest defaults new callers to the cross-task bench scope', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: {
+    code: 0, references: [], totalItems: 306, totalPages: 26, page: 1, pageSize: 12,
+    facets: { visualCategories: [], researchDomains: [] }, corpusVersion: 'zh-CN.v2',
+  } }));
+  try {
+    const result = await referenceLibraryRequest('https://gateway.example', { backendMode: 'gateway' });
+    const queried = await referenceLibraryRequest(
+      'https://gateway.example',
+      { backendMode: 'gateway' },
+      { query: 'cell' },
+    );
+    assert.equal(result.totalItems, 306);
+    assert.equal(result.pageSize, 12);
+    assert.equal(queried.totalItems, 306);
+    assert.deepEqual(JSON.parse(fetchMock.calls[0].options.body), { action: 'referenceLibrary' });
+    assert.deepEqual(JSON.parse(fetchMock.calls[1].options.body), { action: 'referenceLibrary', query: 'cell' });
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('referenceLibraryRequest sends exact reference IDs and keeps the pagination envelope', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: {
+    code: 0,
+    references: [{ id: 'ref_9' }, { id: 'ref_2' }],
+    totalItems: 2,
+    totalPages: 1,
+    page: 1,
+    pageSize: 2,
+    facets: { visualCategories: [], researchDomains: [] },
+    corpusVersion: 'zh-CN.v2',
+  } }));
+  try {
+    const result = await referenceLibraryRequest(
+      'https://gateway.example',
+      { backendMode: 'gateway' },
+      { referenceIds: ['ref_9', 'ref_2'] },
+    );
+    assert.deepEqual(JSON.parse(fetchMock.calls[0].options.body), {
+      action: 'referenceLibrary',
+      referenceIds: ['ref_9', 'ref_2'],
+    });
+    assert.deepEqual(result.references.map((reference) => reference.id), ['ref_9', 'ref_2']);
+    assert.deepEqual(
+      { page: result.page, pageSize: result.pageSize, totalItems: result.totalItems, totalPages: result.totalPages },
+      { page: 1, pageSize: 2, totalItems: 2, totalPages: 1 },
+    );
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('referenceLibraryRequest rejects exact reference IDs combined with scope before transport', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: { code: 0, references: [] } }));
+  try {
+    await assert.rejects(
+      referenceLibraryRequest(
+        'https://gateway.example',
+        { backendMode: 'gateway' },
+        { referenceIds: ['ref_9'], scope: 'bench' },
+      ),
+      /referenceIds.*scope/i,
+    );
+    assert.equal(fetchMock.calls.length, 0);
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('referenceLibraryRequest rejects exact reference IDs combined with legacy limit before transport', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: { code: 0, references: [] } }));
+  try {
+    await assert.rejects(
+      referenceLibraryRequest(
+        'https://gateway.example',
+        { backendMode: 'gateway' },
+        { referenceIds: ['ref_9'], limit: 1 },
+      ),
+      /referenceIds.*limit/i,
+    );
+    assert.equal(fetchMock.calls.length, 0);
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('referenceLibraryRequest forwards AbortSignal without serializing it', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: { code: 0, references: [] } }));
+  const controller = new AbortController();
+  try {
+    await referenceLibraryRequest('https://gateway.example', { backendMode: 'gateway' }, {
+      scope: 'bench', page: 1, pageSize: 12, signal: controller.signal,
+    });
+    assert.equal(fetchMock.calls[0].options.signal, controller.signal);
+    assert.equal('signal' in JSON.parse(fetchMock.calls[0].options.body), false);
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('reference upload lifecycle explicitly finalizes successful PUTs and aborts failed ones', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: { code: 0, ok: true } }));
+  const uploads = [{
+    objectKey: 'references/user-1/reference.png',
+    uploadToken: 'signed-token',
+    mimeType: 'image/png',
+    size: 123,
+  }];
+  try {
+    await finalizeReferenceUploadRequest('https://gateway.example', { backendMode: 'gateway' }, uploads);
+    await abortReferenceUploadRequest('https://gateway.example', { backendMode: 'gateway' }, uploads);
+    assert.deepEqual(
+      fetchMock.calls.map((call) => JSON.parse(call.options.body)),
+      [
+        { action: 'finalizeReferenceUpload', uploads },
+        { action: 'abortReferenceUpload', uploads },
+      ],
+    );
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('formatClientPlatform translates the complete canonical enum without guessing missing history', () => {
+  assert.deepEqual(
+    ['web', 'miniprogram', 'android', 'ios', 'windows', 'macos', 'harmony'].map(formatClientPlatform),
+    ['Web 网页', '微信小程序', 'Android', 'iOS', 'Windows', 'macOS', 'HarmonyOS'],
+  );
+  assert.equal(formatClientPlatform(''), '未记录');
+  assert.equal(formatClientPlatform(undefined), '未记录');
+  assert.equal(formatClientPlatform('mobile'), '未记录');
+});
+
+test('admin and user task normalization retain both platform aliases without backfilling history', async () => {
+  const responses = [
+    { code: 0, jobs: [
+      { id: 'admin-camel', clientPlatform: ' WINDOWS ' },
+      { id: 'admin-empty-alias', clientPlatform: 'macos', client_platform: '' },
+      { id: 'admin-invalid-alias', clientPlatform: 'harmony', client_platform: 'mobile' },
+      { id: 'admin-conflict', clientPlatform: 'windows', client_platform: 'ios' },
+      { id: 'admin-legacy' },
+    ] },
+    { code: 0, jobs: [{ id: 'user-snake', client_platform: 'harmony' }, { id: 'user-invalid', clientPlatform: 'mobile' }] },
+  ];
+  const fetchMock = mockJsonFetch(() => ({ body: responses.shift() }));
+  try {
+    const admin = await adminJobsRequest('https://gateway.example', { backendMode: 'gateway' });
+    const user = await userJobsRequest('https://gateway.example', { backendMode: 'gateway' });
+
+    assert.deepEqual(
+      admin.jobs.map(({ id, clientPlatform, client_platform }) => ({ id, clientPlatform, client_platform })),
+      [
+        { id: 'admin-camel', clientPlatform: 'windows', client_platform: 'windows' },
+        { id: 'admin-empty-alias', clientPlatform: 'macos', client_platform: 'macos' },
+        { id: 'admin-invalid-alias', clientPlatform: 'harmony', client_platform: 'harmony' },
+        { id: 'admin-conflict', clientPlatform: 'windows', client_platform: 'windows' },
+        { id: 'admin-legacy', clientPlatform: '', client_platform: '' },
+      ],
+    );
+    assert.deepEqual(
+      user.jobs.map(({ id, clientPlatform, client_platform }) => ({ id, clientPlatform, client_platform })),
+      [
+        { id: 'user-snake', clientPlatform: 'harmony', client_platform: 'harmony' },
+        { id: 'user-invalid', clientPlatform: '', client_platform: '' },
+      ],
+    );
+    assert.equal(formatClientPlatform(admin.jobs.at(-1).clientPlatform), '未记录');
+    assert.equal(formatClientPlatform(user.jobs[1].client_platform), '未记录');
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('unsupported transport fails before a network request', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: {} }));
+  try {
+    for (const backendMode of ['fastapi', 'laf', 'direct']) await assert.rejects(createJobRequest('https://retired.example', { backendMode }, {}), /认证网关/);
+    assert.equal(fetchMock.calls.length, 0);
+  } finally { fetchMock.restore(); }
+});
+
+test('userJobsRequest trusts the freshly signed list response without N+1 detail requests', async () => {
+  const fetchMock = mockJsonFetch(() => ({
+    body: {
+      code: 0,
+      jobs: [{
+        _id: 'job-list-1',
+        status: 'succeeded',
+        resultImages: [{ filename: 'job-list-1/candidate.png', storage: 'bucket', url: 'https://oss.example/signed' }],
+      }],
+    },
+  }));
+  try {
+    const result = await userJobsRequest('https://gateway.example', { backendMode: 'gateway' });
+    assert.equal(fetchMock.calls.length, 1);
+    assert.equal(result.jobs[0].result_images[0].url, 'https://oss.example/signed');
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('modelRegistryRequest reads the server-authoritative model roles and defaults', async () => {
+  const fetchMock = mockJsonFetch(() => ({
+    body: {
+      code: 0,
+      registryVersion: '2026-08-19',
+      routeContractVersion: 1,
+      supportsModelRoutes: true,
+      providers: {
+        gemini: {
+          accessKind: 'byok',
+          releasedAt: '2026-08-01',
+          officialSourceUrl: 'https://ai.google.dev/',
+          routeContractVersion: 1,
+          accountCatalogRequired: true,
+          defaults: { main: 'gemini-3.7-flash', image: 'gemini-3.1-flash-image', vision: 'gemini-3.7-flash' },
+          models: [{ id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash', roles: ['main', 'vision'], capabilities: { referenceImages: true }, protocol: 'gemini-generate-content', availabilityNotes: 'Stable' }],
+        },
+      },
+    },
+  }));
+  try {
+    const registry = await modelRegistryRequest('https://gateway.example', { backendMode: 'gateway' });
+    assert.equal(JSON.parse(fetchMock.calls[0].options.body).action, 'modelRegistry');
+    assert.equal(registry.providers.gemini.defaults.main, 'gemini-3.7-flash');
+    assert.deepEqual(registry.providers.gemini.models[0].roles, ['main', 'vision']);
+    assert.equal(registry.routeContractVersion, 1);
+    assert.equal(registry.supportsModelRoutes, true);
+    assert.equal(registry.providers.gemini.accessKind, 'byok');
+    assert.equal(registry.providers.gemini.releasedAt, '2026-08-01');
+    assert.equal(registry.providers.gemini.officialSourceUrl, 'https://ai.google.dev/');
+    assert.equal(registry.providers.gemini.routeContractVersion, 1);
+    assert.equal(registry.providers.gemini.accountCatalogRequired, true);
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('health and registry reads pass cancellation to fetch without changing the API body', async () => {
+  const controller = new AbortController();
+  const fetchMock = mockJsonFetch(() => ({ body: { code: 0, runtime: 'gateway', providers: {} } }));
+  try {
+    await fetchBackendHealth('https://gateway.example', { signal: controller.signal });
+    await modelRegistryRequest('https://gateway.example', { backendMode: 'gateway' }, '', { signal: controller.signal });
+    assert.equal(fetchMock.calls[0].options.signal, controller.signal);
+    assert.equal(fetchMock.calls[1].options.signal, controller.signal);
+    assert.deepEqual(JSON.parse(fetchMock.calls[1].options.body), { action: 'modelRegistry' });
+    controller.abort();
+    assert.equal(fetchMock.calls[1].options.signal.aborted, true);
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('benchmark clients use only the public and admin action contracts', async () => {
+  const fetchMock = mockJsonFetch((_url, options) => ({ body: { code: 0, echoed: JSON.parse(options.body) } }));
+  try {
+    await benchmarkLeaderboardRequest('https://gateway.example', { backendMode: 'gateway' }, { lane: '2K-standard', axis: 'topology' });
+    await benchmarkModelProfileRequest('https://gateway.example', { backendMode: 'gateway' }, 'model-a');
+    await benchmarkCaseEvidenceRequest('https://gateway.example', { backendMode: 'gateway' }, 'case-a', { cursor: '12', limit: 12 });
+    await benchmarkMethodologyRequest('https://gateway.example', { backendMode: 'gateway' });
+    await benchmarkPromptSubmissionRequest('https://gateway.example', { backendMode: 'gateway' }, {
+      prompt: 'Draw a bilingual topology diagram.',
+      capability: 'bilingual topology',
+      requiredElements: 'Chinese and English labels',
+      forbiddenResults: 'garbled text',
+      notes: 'Community proposal',
+    });
+    await adminBenchmarkRequest('https://gateway.example', { backendMode: 'gateway' }, 'adminBenchmarkControl', { runId: 'run-1', targetState: 'paused' });
+    await adminBenchmarkRequest('https://gateway.example', { backendMode: 'gateway' }, 'adminBenchmarkPromptQueue', { status: 'pending' });
+    assert.deepEqual(fetchMock.calls.map((call) => JSON.parse(call.options.body)), [
+      { action: 'benchmarkLeaderboard', lane: '2K-standard', axis: 'topology' },
+      { action: 'benchmarkModelProfile', modelId: 'model-a' },
+      { action: 'benchmarkCaseEvidence', caseId: 'case-a', cursor: '12', limit: 12 },
+      { action: 'benchmarkMethodology' },
+      {
+        action: 'benchmarkPromptSubmission',
+        prompt: 'Draw a bilingual topology diagram.',
+        capability: 'bilingual topology',
+        requiredElements: 'Chinese and English labels',
+        forbiddenResults: 'garbled text',
+        notes: 'Community proposal',
+      },
+      { action: 'adminBenchmarkControl', runId: 'run-1', targetState: 'paused' },
+      { action: 'adminBenchmarkPromptQueue', status: 'pending' },
+    ]);
+  } finally {
+    fetchMock.restore();
+  }
+});
+
+test('shared job payloads preserve 512 and native-size resolution values', async () => {
+  const fetchMock = mockJsonFetch(() => ({ body: { code: 0, jobId: 'fixture-size', status: 'queued' } }))
+  try {
+    for (const imageSize of ['512', 'auto']) {
+      await refineImageRequest('https://fixture.invalid/api', { backendMode: 'gateway' }, { provider: 'gemini', sourceImageObjectKey: 'owned/source.png', editInstruction: 'clear labels', imageSize })
+      assert.equal(JSON.parse(fetchMock.calls.at(-1).options.body).imageSize, imageSize)
+    }
+  } finally { fetchMock.restore() }
+})
+
+test('model material generation and refined recovery preserve files and independent manual references',async()=>{
+ const sourceMaterials=[{id:'a',filename:'data.csv',format:'csv',size:11,text:'A,35',status:'ready',warnings:[],sha256:'a'.repeat(64)}];
+ const context={generationPath:'model-v1',sourceMaterials,figureTypeId:'bar',retrievalSetting:'manual',manualReferenceIds:['paper-1']};
+ const mock=mockJsonFetch((_url,options)=>JSON.parse(options.body).action==='createJob'?{code:0,jobId:'new',status:'queued'}:{code:0,job:{id:'refined',...context,generationContext:context}});
+ try{
+  await createJobRequest('https://gateway.example',{backendMode:'gateway'},{...context,outputFormat:'svg'});
+  const sent=JSON.parse(mock.calls[0].options.body);assert.equal(sent.generationPath,'model-v1');assert.deepEqual(sent.sourceMaterials,sourceMaterials);assert.equal(sent.retrievalSetting,'manual');
+  const restored=await getJobRequest('https://gateway.example',{backendMode:'gateway'},'refined');assert.deepEqual(restored.generationContext,context);assert.deepEqual(restored.manual_reference_ids,['paper-1']);assert.deepEqual(restored.sourceMaterials,sourceMaterials);
+ }finally{mock.restore()}
+})
+
+test('read-only account catalogs isolate keys and reject probes before transport',async()=>{
+ const mock=mockJsonFetch(()=>({body:{code:0,catalog:{state:'ready'},providerRegistry:{models:[]}}}))
+ try{
+  await providerAccountCatalogRequest('https://gateway.example',{runtime:'gateway'},{mode:'catalog',provider:'openai',apiKeys:{openai:'selected',ark:'unrelated'},continuation:{page:2}})
+  const body=JSON.parse(mock.calls[0].options.body);assert.deepEqual(body.apiKeys,{openai:'selected'});assert.deepEqual(body.continuation,{page:2});assert.equal(body.mode,'catalog')
+  await assert.rejects(()=>providerAccountCatalogRequest('https://gateway.example',{runtime:'gateway'},{mode:'catalog',provider:'openai',probes:[]}))
+  assert.equal(mock.calls.length,1)
+ }finally{mock.restore()}
+})

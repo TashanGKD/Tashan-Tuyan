@@ -1,0 +1,114 @@
+import { buildAspectRatioOptions, buildResolutionOptions } from './aspect-ratios'
+import type { ModelRegistry, ModelProviderId } from './model-registry'
+import type { ProviderRegions } from './provider-regions'
+import { PLOT_CATEGORY_ID, type ImageSize, type ProviderId, type RetrievalSetting } from './constants'
+import {
+  buildModelSubmission,
+  requiredCreateRouteRoles,
+  scopedApiKeysForRoles,
+  type ModelRoutes,
+} from './model-routing'
+import type { ReferenceImageMode } from './reference-mode'
+
+export interface UploadedReferenceImage {
+  filename: string
+  mimeType: string
+  size: number
+  objectKey: string
+  uploadToken: string
+}
+
+export interface CreateJobInput {
+  providerRegions?: ProviderRegions
+  configurationMode: 'simple' | 'advanced'
+  provider: ProviderId
+  registry?: { routeContractVersion?: number; providerRegionContractVersion?: number; providers?: ModelRegistry['providers'] } | null
+  modelRoutes?: ModelRoutes
+  apiKeys?: Record<string, string>
+  apiKey?: string
+  categoryId: string
+  categoryLabel: string
+  methodContent: string
+  caption: string
+  negativePrompt?: string
+  outputFormat: string
+  imageSize: ImageSize
+  mainModelName?: string
+  imageModelName?: string
+  referenceVisionModelName?: string
+  referenceImageMode: ReferenceImageMode
+  uploadedReferenceImages: UploadedReferenceImage[]
+  pipelineMode: string
+  retrievalSetting: RetrievalSetting
+  manualReferenceIds: string[]
+  aspectRatio: string
+  numCandidates: number
+  maxCriticRounds: number
+}
+
+// createJob 请求体构造，字段与 packages/api/src/jobs.js 的 createJobRequest 白名单逐一对应。
+// 纯函数（不依赖 wx），便于 node 单测覆盖 plot / 锁检索 / 手动参考的组合语义。
+export function buildCreateJobPayload(input: CreateJobInput): Record<string, unknown> {
+  const hasUploadedReferences = input.uploadedReferenceImages.length > 0
+  const modelRoutes = input.modelRoutes || {
+    main: { accessProvider: input.provider, modelId: String(input.mainModelName || '') },
+    image: { accessProvider: input.provider, modelId: String(input.imageModelName || '') },
+    vision: { accessProvider: input.provider, modelId: String(input.referenceVisionModelName || '') },
+  }
+  const modelSubmission = buildModelSubmission({
+    providerRegions: input.providerRegions,
+    configurationMode: input.configurationMode,
+    modelRoutes,
+    registry: input.registry || null,
+  })
+  const pipelineMode = input.pipelineMode
+  const retrievalSetting = !hasUploadedReferences ? input.retrievalSetting : 'none'
+  const taskName = input.categoryId === PLOT_CATEGORY_ID ? 'plot' : 'diagram'
+  const maxCriticRounds = input.maxCriticRounds
+  const selectedImage = input.registry?.providers?.[modelRoutes.image.accessProvider as ModelProviderId]?.models.find(model => model.id === modelRoutes.image.modelId)
+  const routeRoles = requiredCreateRouteRoles({
+    imageRefineMode: selectedImage?.capabilities.imageEditMode,
+    modelRoutes,
+    outputFormat: input.outputFormat,
+    taskName,
+    pipelineMode,
+    retrievalSetting,
+    imageSize: input.imageSize,
+    referenceImages: input.uploadedReferenceImages,
+    referenceImageMode: input.referenceImageMode,
+  }, maxCriticRounds)
+  if (routeRoles.includes('image') && input.registry?.providers) {
+    const route = modelRoutes.image
+    const model = input.registry.providers[route.accessProvider as ModelProviderId]?.models.find((model) => model.id === route.modelId)
+    if (model?.capabilities.requiresSourceImage) throw new Error('当前型号仅支持图像编辑，请在精修中使用或更换生图模型。')
+    if (Array.isArray(model?.capabilities.outputFormats) && !(model.capabilities.outputFormats as string[]).includes(input.outputFormat)) throw new Error('当前模型不支持此输出格式，请重新选择。')
+    const ratios = buildAspectRatioOptions({ capabilities: model?.capabilities || {}, capabilityField: taskName === 'plot' ? 'refineAspectRatios' : 'aspectRatios', resolution: input.imageSize })
+    const resolutions = buildResolutionOptions(model?.capabilities || {}, taskName === 'plot' ? 'refineResolutions' : 'resolutions')
+    if (!ratios.some((option) => option.value === input.aspectRatio && !option.disabled) || !resolutions.some(option => option.value === input.imageSize)) throw new Error('当前比例或清晰度不可用，请重新选择生成设置。')
+  }
+  const providedKeys = Object.fromEntries(Object.entries(input.apiKeys || {}).map(([provider, key]) => [provider, String(key || '').trim()]))
+  if (input.apiKey && !providedKeys[input.provider]) providedKeys[input.provider] = input.apiKey.trim()
+
+  return {
+    action: 'createJob',
+    clientPlatform: 'miniprogram',
+    ...modelSubmission,
+    apiKeys: scopedApiKeysForRoles(modelRoutes, routeRoles, providedKeys, input.providerRegions),
+    taskName,
+    methodContent: input.methodContent.trim(),
+    caption: input.caption.trim(),
+    negativePrompt: String(input.negativePrompt || '').trim(),
+    infographicCategory: input.categoryLabel,
+    outputFormat: input.outputFormat,
+    imageSize: input.imageSize,
+    referenceImageMode: hasUploadedReferences ? input.referenceImageMode : undefined,
+    referenceImages: input.uploadedReferenceImages,
+    pipelineMode,
+    // 上传参考图时以图为唯一风格来源，前端同步关闭检索（后端亦强制，二者一致）。
+    retrievalSetting,
+    manualReferenceIds: input.retrievalSetting === 'manual' && !hasUploadedReferences ? input.manualReferenceIds : [],
+    aspectRatio: input.aspectRatio,
+    numCandidates: input.numCandidates,
+    maxCriticRounds,
+  }
+}

@@ -1,0 +1,99 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import test from 'node:test'
+import React from 'react'
+import { renderToStaticMarkup } from 'react-dom/server'
+import { SiteNavigation } from '../src/components/WorkbenchHeader.jsx'
+
+const readSource = (relativePath) => readFileSync(new URL(relativePath, import.meta.url), 'utf8')
+
+test('main routes leaderboard and canonicalizes legacy bench before render', () => {
+  const source = readSource('../src/main.jsx')
+  assert.match(source, /canonicalizeLeaderboardLocation/u)
+  assert.match(source, /图研 Tuyan Benchmark · 科研图示生成与编辑模型基准评测/u)
+  assert.doesNotMatch(source, /PaperBanana 模型横评/u)
+})
+
+test('workspace header exposes leaderboard and mini-program without retired client links', () => {
+  const source = readSource('../src/App.jsx') + readSource('../src/components/WorkbenchHeader.jsx')
+  for (const [section, active] of [['workbench', '工作台'], ['leaderboard', '排行榜'], ['changelog', '更新日志']]) {
+    const nav = document.createElement('div')
+    nav.innerHTML = renderToStaticMarkup(React.createElement(SiteNavigation, { section }))
+    const links = [...nav.querySelectorAll('.header-primary-link')]
+    assert.deepEqual(links.map(link => [link.textContent.trim(), link.getAttribute('href')]), [['工作台', '/'], ['排行榜', '/leaderboard'], ['更新日志', '/changelog']])
+    assert.deepEqual(links.filter(link => link.getAttribute('aria-current') === 'page').map(link => link.textContent.trim()), [active])
+    assert.deepEqual([...nav.querySelectorAll('.header-group')].map(group=>group.getAttribute('aria-label')), ['页面导航','工具与生态','支持与交流','语言与账户'])
+    assert.deepEqual([...nav.querySelectorAll('.header-group-pages a')].map(link=>link.textContent.trim()), ['工作台','排行榜','openacad','更新日志'])
+  }
+  assert.match(source, /微信小程序/u)
+  assert.match(source, /t\("论文方法内容"\)/u)
+  assert.match(source, />\s*GitHub/u)
+  assert.doesNotMatch(source, /Android 版|Windows 版|Mac 版|MonitorDown|\bApple\b/u)
+  assert.doesNotMatch(source, /className="brand-tags"|>多智能体<|>学术图示生成</u)
+})
+
+test('leaderboard headers use the 图研Tuyan brand without the retired subtitle', () => {
+  for (const relativePath of ['../src/components/LeaderboardRoot.jsx', '../src/components/BenchmarkPage.jsx', '../src/components/BenchmarkMethodologyPage.jsx', '../src/components/BenchmarkEvidencePages.jsx']) {
+    const source = readSource(relativePath)
+    assert.doesNotMatch(source, /PaperBanana 标志|>PaperBanana<|PAPERBANANA IMAGE MODEL LEADERBOARD/u)
+  }
+  const root = readSource('../src/components/LeaderboardRoot.jsx')
+  assert.match(root, /<WorkbenchHeader section=\{section\}/u)
+  // All routes share the workbench brand; retired product taglines stay removed.
+  assert.doesNotMatch(root, /多智能体|学术图示生成/u)
+})
+
+test('rendered leaderboard search keeps a visible two-pixel keyboard focus outline', () => {
+  const style = document.createElement('style')
+  style.textContent = readSource('../src/components/benchmark.css')
+  const search = document.createElement('label')
+  search.className = 'bench-search'
+  search.innerHTML = '<span><input type="search" aria-label="测试排行榜搜索"></span>'
+  document.head.append(style)
+  document.body.append(search)
+  try {
+    const input = search.querySelector('input')
+    input.focus()
+    assert.equal(document.activeElement, input)
+    assert.match(style.textContent, /\.bench-search input:focus-visible\s*\{[^}]*outline:\s*2px solid [^;}]+;?[^}]*outline-offset:\s*3px/u)
+    assert.doesNotMatch(style.textContent, /\.bench-search input\s*\{[^}]*outline:\s*(?:0|none)/u)
+  } finally {
+    search.remove()
+    style.remove()
+  }
+})
+
+test('leaderboard CSS keeps the page bounded and matrix scrollable with a sticky model column at 390 and 430 widths', () => {
+  const styles = readSource('../src/components/benchmark.css')
+  assert.match(styles, /\.bench-matrix thead th\[aria-sort="descending"\] button\s*\{/u)
+  assert.doesNotMatch(styles, /\.bench-matrix thead button\[aria-pressed/u)
+  assert.match(styles, /\.bench-shell\s*\{[\s\S]*?overflow-x:\s*clip/u)
+  assert.match(styles, /\.bench-matrix-scroll\s*\{[\s\S]*?overflow-x:\s*auto/u)
+  assert.match(styles, /\.bench-model-column\s*\{[\s\S]*?position:\s*sticky/u)
+  assert.match(styles, /@media\s*\(max-width:\s*640px\)[\s\S]*?\.bench-dimension-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr/u)
+  assert.match(styles, /@media\s*\(min-width:\s*900px\)[\s\S]*?\.bench-dimension-grid\s*\{[\s\S]*?grid-template-columns:\s*repeat\(2,/u)
+  assert.match(styles, /@media\s*\(max-width:\s*430px\)/u)
+  assert.match(styles, /@media\s*\(max-width:\s*430px\)[\s\S]*?\.bench-dimension-table\s*\{[\s\S]*?min-width:\s*0/u)
+  assert.match(styles, /@media\s*\(max-width:\s*390px\)/u)
+  assert.match(styles, /\.bench-method-page\s*\{[\s\S]*?overflow-x:\s*clip/u)
+  assert.match(styles, /\.bench-method-prompt[^{]*\{[^}]*overflow-wrap:\s*anywhere/u)
+  assert.match(styles, /\.bench-method-hash[^{]*\{[^}]*overflow-wrap:\s*anywhere/u)
+  assert.match(styles, /\.bench-method-case\s*\{[^}]*min-width:\s*0[^}]*display:\s*grid/u)
+  assert.match(styles, /\.bench-method-case\s*>\s*\*\s*\{[^}]*min-width:\s*0/u)
+  assert.match(styles, /\.bench-method-prompts\s*\{[^}]*grid-template-columns:\s*repeat\(2,minmax\(0,1fr\)\)/u)
+  assert.match(styles, /\.bench-method-prompt\s*\{(?=[^}]*white-space:\s*pre-wrap)(?=[^}]*max-width:\s*100%)[^}]*\}/u)
+  assert.match(styles, /\.bench-method-rubric-wrap\s*\{[^}]*max-width:\s*100%[^}]*overflow-x:\s*auto/u)
+  assert.match(styles, /\.bench-method-copy-status\s*\{[^}]*overflow-wrap:\s*anywhere/u)
+  assert.match(styles, /\.bench-method-prompt-block button:focus-visible\s*\{[^}]*outline:\s*2px solid/u)
+  assert.match(styles, /@media\s*\(max-width:\s*430px\)[\s\S]*?\.bench-method-case\s*\{[\s\S]*?grid-template-columns:\s*1fr/u)
+  assert.match(styles, /@media\s*\(max-width:\s*430px\)[\s\S]*?\.bench-method-prompts\s*\{[\s\S]*?grid-template-columns:\s*1fr/u)
+  assert.match(styles, /@media\s*\(max-width:\s*430px\)[\s\S]*?\.bench-method-score-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr/u)
+  assert.match(styles, /@media\s*\(max-width:\s*390px\)[\s\S]*?\.bench-method-rubric-wrap\s*\{[\s\S]*?overflow-x:\s*auto/u)
+  assert.doesNotMatch(styles, /gradient\(/u)
+})
+
+test('scientific evidence scores explicitly collapse at 760 and 390 pixels', () => {
+  const styles = readSource('../src/components/benchmark.css')
+  assert.match(styles, /@media\s*\(max-width:\s*760px\)\{(?:(?!@media)[\s\S])*?\.bench-scientific-evidence-card \.bench-evidence-scores\s*\{\s*grid-template-columns:\s*repeat\(4,minmax\(0,1fr\)\)/u)
+  assert.match(styles, /@media\s*\(max-width:\s*390px\)\{(?:(?!@media)[\s\S])*?\.bench-scientific-evidence-card \.bench-evidence-scores\s*\{\s*grid-template-columns:\s*repeat\(2,minmax\(0,1fr\)\)/u)
+})

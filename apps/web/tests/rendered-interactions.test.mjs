@@ -1,0 +1,646 @@
+import assert from 'node:assert/strict'
+import { afterEach, test } from 'node:test'
+import { File } from 'node:buffer'
+import { IDBFactory } from 'fake-indexeddb'
+import React from 'react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import App from '../src/App.jsx'
+import GenerationSettingsDrawer from '../src/components/GenerationSettingsDrawer.jsx'
+import ModelPicker from '../src/components/ModelPicker.jsx'
+import ReferenceLibraryPanel from '../src/components/ReferenceLibraryPanel.jsx'
+import ReferenceUploadPanel from '../src/components/ReferenceUploadPanel.jsx'
+
+const bailianRegistry = {
+  registryVersion: 'test-v2', figureTaxonomyVersion:'2026-10-10.v1',figureExecutionVersion:1,workflowContractVersion:2,materialWorkflowVersion:1,materialFileVersion:2,
+  providers: {
+    bailian: {
+      defaults: { main: 'main-model', image: 'image-png', vision: 'main-model' },
+      models: [
+        {
+          id: 'main-model', label: 'Main Model', vendor: 'Alibaba Qwen', roles: ['main', 'vision'],
+          selectable: true, inputModalities: ['text', 'image'], outputModalities: ['text'], capabilities: {referenceImages:true},
+        },
+        {
+          id: 'image-png', label: 'PNG Image Model', vendor: 'Alibaba Wan', roles: ['image'],
+          selectable: true, inputModalities: ['text'], outputModalities: ['image'],
+          capabilities: { resolutions: ['1K'], refineResolutions: ['1K', '2K'], outputFormats: ['png'] },
+        },
+      ],
+    },
+  },
+}
+
+afterEach(() => {
+  cleanup()
+  document.body.innerHTML = ''
+  window.localStorage.clear()
+})
+
+test('rendered SVG submit ignores the image model format because the main model generates SVG', async () => {
+  const requests = []
+  const previousFetch = globalThis.fetch
+  globalThis.fetch = async (input, init = {}) => {
+    const body = init.body ? JSON.parse(String(init.body)) : null
+    requests.push({ url: String(input), body })
+    if (!body) return Response.json({ code: 0, runtime: 'gateway' })
+    if (body.action === 'modelRegistry') return Response.json({ code: 0, ...bailianRegistry })
+    if (body.action === 'createJob') return Response.json({ code: 0, jobId: 'job-svg', status: 'queued' })
+    if (body.action === 'getJob') return Response.json({ code: 0, job: { id: 'job-svg', status: 'succeeded', resultImages: [], stages: [] } })
+    throw new Error(`unexpected request ${JSON.stringify(body)}`)
+  }
+
+  try {
+    const user = userEvent.setup()
+    render(React.createElement(App))
+    await waitFor(() => assert.ok(requests.some((request) => request.body?.action === 'modelRegistry')))
+
+    await user.click(screen.getByRole('button', { name: '打开完整设置' }))
+    await user.click(screen.getByRole('button', { name: '阿里云百炼' }))
+    fireEvent.change(screen.getByLabelText('导出格式'), { target: { value: 'svg' } })
+    assert.equal(document.querySelector('[data-model-role="image"]'),null,'SVG must not expose an unused image model')
+    assert.ok(screen.getByText(/主模型规划、编写和修改 SVG/))
+    fireEvent.change(screen.getByLabelText('检索设置'), { target:{value:'none'} })
+    await user.type(screen.getByPlaceholderText('sk-...'), 'test-key')
+    await user.click(screen.getByRole('button',{name:'关闭生成设置'}))
+    const submit = screen.getAllByRole('button', { name: '生成候选图' }).find((button) => button.type === 'submit')
+    assert.ok(submit)
+    await user.click(submit)
+
+    await waitFor(() => assert.ok(requests.some((request) => request.body?.action === 'createJob')))
+    const create = requests.find((request) => request.body?.action === 'createJob')
+    assert.equal(create.body.outputFormat, 'svg')
+    assert.equal(create.body.mainModelName, 'main-model')
+    assert.equal(create.body.generationPath,'model-v1')
+    assert.equal(create.body.retrievalSetting,'none')
+    assert.deepEqual(create.body.apiKeys,{bailian:'test-key'})
+  } finally {
+    globalThis.fetch = previousFetch
+  }
+})
+
+test('rendered OpenRouter full catalog omits incompatible models and vendors', async () => {
+  const user = userEvent.setup()
+  const { container } = render(React.createElement(ModelPicker, {
+    label: '图像生成模型',
+    role: 'image',
+    provider: 'openrouter',
+    value: 'compatible',
+    outputFormat: 'png',
+    onChange() {},
+    models: [
+      { id: 'compatible', label: 'Compatible Model', vendor: 'OpenAI', roles: ['image'], selectable: true, recommended: true, outputModalities: ['image'], capabilities: { outputFormats: ['png'] } },
+      ...Array.from({ length: 26 }, (_, index) => ({ id: `blocked-${index}`, label: `Blocked Model ${index}`, vendor: 'Google', roles: [], selectable: false, protocol: 'openrouter-images', outputModalities: ['image'], disabledReason: '未声明 PNG/SVG 输出' })),
+    ],
+  }))
+
+  await user.click(screen.getByRole('button', { name: '图像生成模型' }))
+  assert.equal(container.querySelector('.model-incompatible .model-option'), null)
+  assert.equal(screen.queryByText(/暂不兼容/), null)
+  assert.equal(screen.queryByText('Blocked Model 0'), null)
+  assert.equal(screen.queryByRole('button', { name: '厂商 Google' }), null)
+})
+
+test('rendered aggregator drawers omit disabled-only vendors and unsupported roles', async () => {
+  const user = userEvent.setup()
+  const { container } = render(React.createElement(ModelPicker, {
+    label: '主模型', role: 'main', outputFormat: 'png',
+    route: { accessProvider: 'ark', modelId: 'doubao-current' },
+    onRouteChange() {},
+    providerConfigs: { ark: { label: '火山方舟' } },
+    registry: {
+      providers: {
+        ark: { accessKind: 'aggregator', models: [
+          { id: 'doubao-current', label: 'Doubao Current', vendor: 'ByteDance Doubao', roles: ['main', 'vision'], selectable: true, lifecycle: 'stable' },
+          { id: 'specialized-only', label: 'Specialized Only', vendor: 'Specialist Labs', roles: ['main'], selectable: false, lifecycle: 'stable', disabledReason: '尚未完成 PaperBanana 适配' },
+          { id: 'image-only', label: 'Image Only', vendor: 'Image Labs', roles: ['image'], selectable: true, lifecycle: 'stable' },
+        ] },
+      },
+    },
+  }))
+
+  await user.click(screen.getByRole('button', { name: '主模型' }))
+  assert.ok(screen.getByRole('button', { name: '厂商 字节跳动' }))
+  assert.equal(screen.queryByRole('button', { name: '厂商 Specialist Labs' }), null)
+  assert.equal(screen.queryByRole('button', { name: '厂商 Image Labs' }), null)
+  assert.equal(screen.queryByText('Specialized Only'), null)
+  assert.equal(container.querySelector('.model-incompatible'), null)
+})
+
+test('rendered model cards omit verification badges and keep unsupported specifications unknown', async () => {
+  const user = userEvent.setup()
+  render(React.createElement(ModelPicker, {
+    label: '主模型', role: 'main', provider: 'openrouter', value: 'vendor/catalog-only', onChange() {},
+    models: [
+      {
+        id: 'vendor/catalog-only', label: 'Catalog Only', vendor: 'Vendor', roles: ['main'], selectable: true,
+        lifecycle: 'unknown', verificationState: 'catalog', verified: false,
+      },
+      {
+        id: 'vendor/account-visible', label: 'Account Visible', vendor: 'Vendor', roles: ['main'], selectable: true,
+        lifecycle: 'stable', verificationState: 'account-visible', verified: false,
+      },
+      {
+        id: 'vendor/call-verified', label: 'Call Verified', vendor: 'Vendor', roles: ['main'], selectable: true,
+        lifecycle: 'stable', verificationState: 'inference-verified', verified: true,
+      },
+    ],
+  }))
+
+  await user.click(screen.getByRole('button', { name: '主模型' }))
+  assert.equal(screen.queryByText('官方目录'), null)
+  assert.equal(screen.queryByText(/未实测/), null)
+  assert.equal(screen.queryByText('账号目录可见'), null)
+  assert.equal(screen.queryByText('真实调用已验证'), null)
+  const catalogCard = screen.getAllByText('Catalog Only').at(-1)?.closest('button')
+  assert.ok(catalogCard)
+  const card = catalogCard.closest('.model-option')
+  assert.equal(card.querySelectorAll('dl dt').length, 3)
+  assert.equal(card.querySelectorAll('dl dd').length, 3)
+  assert.equal(card.querySelectorAll('.model-modality-icon.is-unknown').length, 8)
+  assert.equal(card.querySelectorAll('dd')[2].textContent, '待确认')
+  assert.doesNotMatch(catalogCard.textContent, /稳定版/)
+  assert.doesNotMatch(catalogCard.textContent, /真实调用已验证/)
+})
+
+test('rendered route picker shows vendor rail only for aggregator access channels', async () => {
+  const user = userEvent.setup()
+  render(React.createElement(ModelPicker, {
+    label: '主模型', role: 'main', outputFormat: 'png',
+    route: { accessProvider: 'openrouter', modelId: 'openai/gpt' },
+    onRouteChange() {},
+    providerConfigs: { openrouter: { label: 'OpenRouter' }, openai: { label: 'OpenAI' } },
+    registry: {
+      providers: {
+        openrouter: { accessKind: 'aggregator', models: [
+          { id: 'openai/gpt', label: 'GPT', vendor: 'OpenAI', roles: ['main'], selectable: true, recommended: true },
+          { id: 'sourceful/other', label: 'Other', vendor: 'Sourceful', roles: ['main'], selectable: true },
+        ] },
+        openai: { accessKind: 'direct', models: [{ id: 'gpt', label: 'Direct GPT', vendor: 'OpenAI', roles: ['main'], selectable: true, entitlement: 'usage-tier', availabilityNotes: '需开通组织用量等级' }] },
+      },
+    },
+  }))
+
+  await user.click(screen.getByRole('button', { name: '主模型' }))
+  const providerGroup = screen.getByRole('group', { name: 'API 接入渠道' })
+  assert.equal(providerGroup.querySelector('button[aria-pressed="true"]')?.getAttribute('aria-label'), 'OpenRouter')
+  const vendorGroup = screen.getByRole('group', { name: '模型厂商' })
+  assert.equal(vendorGroup.querySelector('button[aria-pressed="true"]')?.getAttribute('aria-label'), '厂商 OpenAI')
+  await user.click(screen.getByRole('button', { name: '厂商 Sourceful' }))
+  assert.ok(screen.getByText('Other'))
+  await user.click(screen.getByRole('button', { name: 'OpenAI' }))
+  assert.ok(screen.getByRole('group', { name: '模型厂商' }))
+  assert.ok(screen.getByText('Direct GPT'))
+  assert.equal(screen.queryByText(/usage-tier/), null)
+  assert.equal(screen.queryByText(/需开通组织用量等级/), null)
+})
+
+test('rendered mobile route picker replaces settings content and supports layered back navigation', async () => {
+  const previousMatchMedia = window.matchMedia
+  window.matchMedia = () => ({ matches: true, addEventListener() {}, removeEventListener() {} })
+  try {
+    const user = userEvent.setup()
+    render(React.createElement(ModelPicker, {
+      label: '图像生成模型', role: 'image', outputFormat: 'png',
+      route: { accessProvider: 'openrouter', modelId: 'sourceful/image' },
+      onRouteChange() {},
+      providerConfigs: { openrouter: { label: 'OpenRouter' }, openai: { label: 'OpenAI' } },
+      registry: {
+        providers: {
+          openrouter: { accessKind: 'aggregator', models: [{ id: 'sourceful/image', label: 'Riverflow', vendor: 'Sourceful', roles: ['image'], selectable: true }] },
+          openai: { accessKind: 'direct', models: [{ id: 'gpt-image', label: 'GPT Image', vendor: 'OpenAI', roles: ['image'], selectable: true }] },
+        },
+      },
+    }))
+    const trigger = screen.queryByRole('button', { name: '图像生成模型' })
+    assert.ok(trigger, 'model route trigger should render')
+    await user.click(trigger)
+    assert.ok(screen.queryByRole('heading', { name: '选择 API 接入渠道' }), 'mobile opens at provider layer')
+    assert.equal(screen.queryByRole('region', { name: '具体模型列表' }), null)
+    await user.click(screen.getByRole('button', { name: 'OpenRouter' }))
+    assert.ok(screen.queryByRole('heading', { name: '选择模型厂商' }), 'aggregator opens vendor layer')
+    const vendorBack = screen.getByRole('button', { name: /返回 API 接入渠道/ })
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    assert.equal(document.activeElement === vendorBack, true, 'provider to vendor should focus the new back button')
+    await user.click(screen.getByRole('button', { name: '厂商 Sourceful' }))
+    const aggregatorModelBack = screen.getByRole('button', { name: /返回 模型厂商/ })
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    assert.equal(document.activeElement === aggregatorModelBack, true, 'vendor to model should focus the new back button')
+    await user.click(aggregatorModelBack)
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    assert.equal(document.activeElement === screen.getByRole('button', { name: '厂商 Sourceful' }), true, 'model back should restore the selected vendor')
+    await user.click(screen.getByRole('button', { name: /返回 API 接入渠道/ }))
+    assert.ok(screen.queryByRole('heading', { name: '选择 API 接入渠道' }), 'vendor back returns to provider layer')
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    assert.equal(document.activeElement === screen.getByRole('button', { name: 'OpenRouter' }), true, 'vendor back should restore the selected provider')
+    await user.click(screen.getByRole('button', { name: 'OpenAI' }))
+    assert.ok(screen.queryByRole('heading', { name: '选择模型厂商' }), 'direct provider preserves the vendor layer')
+    await user.click(screen.getByRole('button', { name: '厂商 OpenAI' }))
+    const directModelBack = screen.getByRole('button', { name: /返回 模型厂商/ })
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    assert.equal(document.activeElement === directModelBack, true, 'direct provider should focus the model back button')
+    assert.ok(screen.getByText('GPT Image'))
+    await user.click(directModelBack)
+    assert.ok(screen.queryByRole('heading', { name: '选择模型厂商' }), 'model back returns to vendor layer for direct access')
+    await user.click(screen.getByRole('button', { name: /返回 API 接入渠道/ }))
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    assert.equal(document.activeElement === screen.getByRole('button', { name: 'OpenAI' }), true, 'direct model back should restore the selected provider')
+  } finally {
+    window.matchMedia = previousMatchMedia
+  }
+})
+
+test('compact aggregator with compatible drift but no recommendations exposes vendors and all models', async () => {
+  const previousMatchMedia = window.matchMedia
+  window.matchMedia = () => ({ matches: true, addEventListener() {}, removeEventListener() {} })
+  try {
+    const user = userEvent.setup()
+    render(React.createElement(ModelPicker, {
+      label: '主模型', role: 'main', outputFormat: 'png',
+      route: { accessProvider: 'openrouter', modelId: 'drift/model-a' },
+      onRouteChange() {},
+      providerConfigs: { openrouter: { label: 'OpenRouter' } },
+      registry: {
+        providers: {
+          openrouter: { accessKind: 'aggregator', models: [
+            { id: 'drift/model-a', label: 'Drift Model A', vendor: 'Drift Labs', roles: ['main'], selectable: true, lifecycle: 'stable', recommended: false },
+            { id: 'other/model-b', label: 'Other Model B', vendor: 'Other Labs', roles: ['main'], selectable: true, lifecycle: 'stable' },
+          ] },
+        },
+      },
+    }))
+
+    await user.click(screen.getByRole('button', { name: '主模型' }))
+    await user.click(screen.getByRole('button', { name: 'OpenRouter' }))
+    assert.ok(screen.getByRole('button', { name: '厂商 开发方待确认' }))
+    assert.equal(screen.queryByRole('button', { name: '厂商 Other Labs' }), null)
+    await user.click(screen.getByRole('button', { name: '厂商 开发方待确认' }))
+
+    assert.ok(screen.getByRole('button', { name: /Drift Model A/ }))
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    assert.equal(document.activeElement === screen.getByRole('button', { name: /返回 模型厂商/ }), true)
+  } finally {
+    window.matchMedia = previousMatchMedia
+  }
+})
+
+test('rendered route picker reacts to the compact media query while open and removes its listener', async () => {
+  const previousMatchMedia = window.matchMedia
+  let changeListener = null
+  let removedListener = null
+  const media = {
+    matches: false,
+    addEventListener(type, listener) { if (type === 'change') changeListener = listener },
+    removeEventListener(type, listener) { if (type === 'change') removedListener = listener },
+  }
+  window.matchMedia = () => media
+  try {
+    const rendered = render(React.createElement(ModelPicker, {
+      label: '主模型', role: 'main', provider: 'openai', value: 'main', outputFormat: 'png', onChange() {},
+      models: [{ id: 'main', label: 'Main', vendor: 'OpenAI', roles: ['main'], selectable: true }],
+    }))
+    await userEvent.setup().click(screen.getByRole('button', { name: '主模型' }))
+    assert.ok(screen.getByRole('region', { name: '具体模型列表' }))
+    assert.equal(typeof changeListener, 'function')
+
+    act(() => {
+      media.matches = true
+      changeListener({ matches: true })
+    })
+    assert.ok(screen.getByRole('heading', { name: '选择 API 接入渠道' }))
+    assert.equal(screen.queryByRole('region', { name: '具体模型列表' }), null)
+
+    act(() => {
+      media.matches = false
+      changeListener({ matches: false })
+    })
+    assert.ok(screen.getByRole('region', { name: '具体模型列表' }))
+    rendered.unmount()
+    assert.equal(removedListener, changeListener)
+  } finally {
+    window.matchMedia = previousMatchMedia
+  }
+})
+
+test('rendered reference upload blocks file selection until advanced retrieval is set to none', () => {
+  const added = []
+  const { container } = render(React.createElement(ReferenceUploadPanel, {
+    images: [],
+    error: '',
+    disabled: false,
+    isUploading: false,
+    retrievalBlocked: true,
+    onAddFiles: (files) => added.push(files),
+    onRemove() {},
+  }))
+
+  assert.ok(screen.getByText(/请先将检索设置切换为“不使用检索”/))
+  const input = container.querySelector('input[type="file"]')
+  assert.ok(input)
+  assert.equal(input.disabled, true)
+  fireEvent.change(input, { target: { files: [new window.File(['image'], 'reference.png', { type: 'image/png' })] } })
+  assert.deepEqual(added, [])
+})
+
+for (const [retrievalValue, retrievalLabel] of [
+  ['auto', '自动检索'],
+  ['random', '随机参考'],
+  ['manual', '手动参考'],
+]) {
+  test(`rendered App keeps local materials independent of ${retrievalValue} retrieval`, async () => {
+    const requests = []
+    const previousFetch = globalThis.fetch
+    const previousIndexedDB = globalThis.indexedDB
+    const previousStorage = globalThis.localStorage
+    globalThis.indexedDB = new IDBFactory()
+    globalThis.localStorage = window.localStorage
+    globalThis.fetch = async (input, init = {}) => {
+      const body = init.body ? JSON.parse(String(init.body)) : null
+      requests.push({ url: String(input), body })
+      if (!body) return Response.json({ code: 0, runtime: 'gateway' })
+      if (body.action === 'modelRegistry') return Response.json({ code: 0, ...bailianRegistry })
+      if (body.action === 'referenceLibrary') {
+        return Response.json({
+          code: 0,
+          references: [],
+          page: 1,
+          pageSize: 12,
+          totalItems: 0,
+          totalPages: 1,
+          corpusVersion: 'zh-CN.v2',
+          facets: { visualCategories: [], researchDomains: [] },
+        })
+      }
+      throw new Error(`unexpected request ${JSON.stringify(body)}`)
+    }
+
+    try {
+      const user = userEvent.setup()
+      render(React.createElement(App))
+      await waitFor(() => assert.ok(requests.some((request) => request.body?.action === 'modelRegistry')))
+      await user.click(screen.getByRole('button', { name: '打开完整设置' }))
+      await user.click(screen.getByRole('button', { name: /专业模式/ }))
+
+      const retrieval = screen.getByLabelText('检索设置')
+      fireEvent.change(retrieval, { target: { value: retrievalValue } })
+      assert.equal(retrieval.value, retrievalValue)
+      assert.equal(screen.queryByText(/请先将检索设置切换为“不使用检索”/),null)
+      if (retrievalValue === 'manual') {
+        await screen.findByRole('button', { name: /打开参考图库/ })
+      }
+
+      await user.click(screen.getByRole('button',{name:'关闭生成设置'}))
+      const fileInput = screen.getByLabelText('上传文件')
+      await waitFor(()=>assert.equal(fileInput.disabled,false))
+      fireEvent.change(fileInput, {
+        target: { files: [new File(['group,value\nA,35'], `${retrievalValue}-data.csv`, { type: 'text/csv' })] },
+      })
+      await screen.findByText('已保存到浏览器 · 待读取')
+      assert.ok(screen.getByText(`${retrievalValue}-data.csv`))
+      assert.equal(requests.some(r=>r.body?.action==='prepareMaterialUpload'),false,'Selecting a file must not upload it')
+      await user.click(screen.getByRole('button',{name:'打开完整设置'}))
+      assert.equal(screen.getByLabelText('检索设置').value,retrievalValue,`${retrievalLabel} must not be changed silently`)
+      assert.equal(screen.getByLabelText('检索设置').disabled,false)
+      assert.equal(JSON.parse(window.localStorage.getItem('tuyan.figure-settings.v1')).retrievalSetting,retrievalValue)
+    } finally {
+      globalThis.fetch = previousFetch
+      globalThis.indexedDB = previousIndexedDB
+      globalThis.localStorage = previousStorage
+    }
+  })
+}
+
+test('rendered model search resets both incremental state and a deeply scrolled DOM window', async () => {
+  const models = Array.from({ length: 36 }, (_, index) => ({
+    id: `model-${index}`,
+    label: `Model ${index}`,
+    vendor: index % 2 ? 'Google' : 'OpenAI',
+    roles: ['image'],
+    selectable: true,
+    outputModalities: ['image'],
+    capabilities: { outputFormats: ['png'] },
+  }))
+  const { container } = render(React.createElement(ModelPicker, {
+    label: '图像生成模型', role: 'image', provider: 'openai', value: 'model-0', outputFormat: 'png', models, onChange() {},
+  }))
+  const user = userEvent.setup()
+  await user.click(screen.getByRole('button', { name: '图像生成模型' }))
+  const modelWindow = container.querySelector('.model-picker-window')
+  assert.ok(modelWindow)
+  modelWindow.scrollTop = 1260
+  fireEvent.scroll(modelWindow)
+  assert.equal(modelWindow.scrollTop, 1260)
+
+  fireEvent.change(screen.getByRole('searchbox', { name: '搜索图像生成模型' }), { target: { value: 'Model 35' } })
+
+  assert.equal(modelWindow.scrollTop, 0)
+  assert.ok(screen.getByText('Model 35'))
+})
+
+test('rendered model list reveals compatible batches and wraps keyboard focus without incompatible entries', async () => {
+  const models = [
+    ...Array.from({ length: 26 }, (_, index) => ({
+      id: `model-${index}`,
+      label: `Model ${index}`,
+      vendor: 'OpenAI',
+      roles: ['main'],
+      selectable: true,
+      recommended: true,
+      lifecycle: 'stable',
+    })),
+    { id: 'blocked', label: 'Blocked', vendor: 'OpenAI', roles: [], selectable: false, disabledReason: '不兼容', roleReasons: { main: '不兼容' } },
+  ]
+  const user = userEvent.setup()
+  const { container } = render(React.createElement(ModelPicker, {
+    label: '主模型', role: 'main', provider: 'openrouter', value: 'model-0', outputFormat: 'png', models, onChange() {},
+  }))
+  await user.click(screen.getByRole('button', { name: '主模型' }))
+  assert.equal(container.querySelectorAll('.model-picker-window .model-option').length, 24)
+
+  const showMore = screen.getByRole('button', { name: '显示更多模型' })
+  await new Promise((resolve) => setTimeout(resolve, 40))
+  showMore.focus()
+  await user.keyboard('{Enter}')
+  const model24 = container.querySelectorAll('.model-option-select')[24]
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  assert.equal(document.activeElement, model24)
+  await user.tab()
+  assert.equal(document.activeElement, container.querySelectorAll('.model-option-select')[25])
+  assert.equal(screen.queryByText(/暂不兼容/), null)
+  await user.tab()
+  assert.equal(document.activeElement === screen.getByRole('button', { name: '关闭模型选择' }), true)
+})
+
+test('rendered generation drawer focuses its target, closes on Escape, restores focus, and preserves mounted state', async () => {
+  function Harness() {
+    const [open, setOpen] = React.useState(false)
+    const [value, setValue] = React.useState('')
+    return React.createElement(React.Fragment, null,
+      React.createElement('button', { type: 'button', onClick: () => setOpen(true) }, '打开设置'),
+      React.createElement(GenerationSettingsDrawer, { open, onClose: () => setOpen(false), focusSetting: 'target' },
+        React.createElement('label', { 'data-focus-setting': 'target' },
+          '测试字段',
+          React.createElement('input', { value, onChange: (event) => setValue(event.target.value) }),
+        ),
+      ),
+    )
+  }
+
+  render(React.createElement(Harness))
+  const trigger = screen.getByRole('button', { name: '打开设置' })
+  trigger.focus()
+  fireEvent.click(trigger)
+  const input = screen.getByRole('textbox', { name: '测试字段' })
+  await new Promise((resolve) => setTimeout(resolve, 120))
+  assert.equal(document.activeElement === input, true)
+  fireEvent.change(input, { target: { value: '保留的配置' } })
+
+  fireEvent.keyDown(window, { key: 'Escape' })
+
+  assert.equal(screen.getByRole('dialog', { hidden: true }).closest('.generation-drawer-backdrop')?.getAttribute('aria-hidden'), 'true')
+  assert.equal(document.activeElement === trigger, true)
+  assert.equal(input.value, '保留的配置')
+  fireEvent.click(trigger)
+  assert.equal(screen.getByRole('textbox', { name: '测试字段' }).value, '保留的配置')
+})
+
+test('rendered reference gallery paginates, previews full images, and preserves cross-page selection', async () => {
+  const pageOne = [
+    { id: 'one-a', titleZh: '第一页 A', shortIntroZh: '介绍 A', detailZh: '详情 A', title: 'Page one A', summary: 'Summary A', visualCategory: '方法框架图', researchDomain: '通用', keywords: ['A'], imageUrl: 'data:image/png;base64,YQ==' },
+    { id: 'one-b', titleZh: '第一页 B', shortIntroZh: '介绍 B', detailZh: '详情 B', title: 'Page one B', summary: 'Summary B', visualCategory: '流程图', researchDomain: '通用', keywords: ['B'], imageUrl: 'data:image/png;base64,Yg==' },
+  ]
+  const pageTwo = [
+    { id: 'two-a', titleZh: '第二页 A', shortIntroZh: '介绍 C', detailZh: '详情 C', title: 'Page two A', summary: 'Summary C', visualCategory: '系统架构图', researchDomain: '机器学习', keywords: ['C'], imageUrl: 'data:image/png;base64,Yw==' },
+  ]
+  function GalleryHarness() {
+    const [page, setPage] = React.useState(1)
+    const [selectedIds, setSelectedIds] = React.useState([])
+    const references = page === 1 ? pageOne : pageTwo
+    return React.createElement(ReferenceLibraryPanel, {
+      references,
+      selectedIds,
+      pageInfo: { page, pageSize: 12, totalItems: 24, totalPages: 2, corpusVersion: 'zh-CN.v2', facets: { visualCategories: [], researchDomains: [] } },
+      isLoading: false,
+      error: '',
+      onToggle: (id) => setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]),
+      onClear: () => setSelectedIds([]),
+      onRequest: ({ page: requestedPage }) => setPage(requestedPage),
+    })
+  }
+
+  const user = userEvent.setup()
+  render(React.createElement(GalleryHarness))
+  await user.click(screen.getByRole('button', { name: /打开参考图库/ }))
+  const galleryGrid = document.querySelector('.reference-library-grid')
+  galleryGrid.scrollTop = 680
+  await user.click(screen.getAllByRole('button', { name: '选用' })[0])
+  assert.equal(galleryGrid.scrollTop, 680, 'selecting a card preserves the reading position')
+  assert.ok(screen.getAllByText('第一页 A').length >= 1)
+  await user.click(screen.getByRole('button', { name: '下一页' }))
+  assert.ok(await screen.findByText('第二页 A'))
+  assert.equal(galleryGrid.scrollTop, 0, 'new page starts at the top of the gallery')
+  galleryGrid.scrollTop = 420
+  await user.click(screen.getByRole('button', { name: '选用' }))
+  assert.ok(screen.getByTitle('移除 第一页 A'))
+  assert.ok(screen.getByTitle('移除 第二页 A'))
+
+  await user.click(screen.getByRole('button', { name: '预览 第二页 A 大图' }))
+  assert.equal(screen.getAllByRole('dialog').length, 2)
+  assert.ok(screen.getByRole('button', { name: '关闭大图预览' }))
+  assert.ok(screen.getByText('详情 C'))
+  await user.click(screen.getByRole('button', { name: '关闭大图预览' }))
+  await user.click(screen.getByRole('button', { name: '上一页' }))
+  assert.equal(galleryGrid.scrollTop, 0, 'previous page also starts at the top')
+  const selectedAgain = await screen.findByRole('button', { name: /已选用，点击取消/ })
+  assert.equal(selectedAgain.getAttribute('aria-pressed'), 'true')
+})
+
+test('opening the reference gallery does not queue a delayed reset after pagination', async () => {
+  const pageOne = [{ id: 'race-one', titleZh: '竞态第一页', shortIntroZh: '第一页', title: 'Race one', summary: 'One', visualCategory: '流程图', researchDomain: '通用', keywords: [] }]
+  const pageTwo = [{ id: 'race-two', titleZh: '竞态第二页', shortIntroZh: '第二页', title: 'Race two', summary: 'Two', visualCategory: '流程图', researchDomain: '通用', keywords: [] }]
+  const requests = []
+  function GalleryRaceHarness() {
+    const [page, setPage] = React.useState(1)
+    return React.createElement(ReferenceLibraryPanel, {
+      references: page === 1 ? pageOne : pageTwo,
+      selectedIds: [],
+      pageInfo: { page, pageSize: 12, totalItems: 24, totalPages: 2, corpusVersion: 'zh-CN.v2', facets: { visualCategories: [], researchDomains: [] } },
+      isLoading: false,
+      error: '',
+      onToggle() {},
+      onClear() {},
+      onRequest: ({ page: requestedPage }) => { requests.push(requestedPage); setPage(requestedPage) },
+    })
+  }
+
+  render(React.createElement(GalleryRaceHarness))
+  fireEvent.click(screen.getByRole('button', { name: /打开参考图库/ }))
+  fireEvent.click(screen.getByRole('button', { name: '下一页' }))
+  assert.ok(screen.getByText('竞态第二页'))
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 350)) })
+  assert.ok(screen.getByText('竞态第二页'))
+  assert.deepEqual(requests, [2])
+})
+
+test('ordinary mode offers only complete providers', async () => {
+  const { default: ModelRoutingSettings } = await import('../src/components/ModelRoutingSettings.jsx')
+  const { PROVIDERS } = await import('../src/constants.js')
+  const modelRegistry = { routeContractVersion: 1, providers: {
+    xai: { defaults: { main: 'grok-4.6', image: 'grok-imagine-image-2.0', vision: 'grok-4.6' }, models: [] },
+    anthropic: { defaults: { main: 'claude-fable-5-1', image: '', vision: 'claude-fable-5-1' }, models: [] },
+    recraft: { defaults: { main: '', image: 'recraftv4_1', vision: '' }, models: [] },
+  } }
+  const { container } = render(React.createElement(ModelRoutingSettings, {
+    configurationMode: 'simple', simpleProvider: 'xai', modelRegistry, providerConfigs: PROVIDERS,
+    modelRoutes: Object.fromEntries(Object.entries(modelRegistry.providers.xai.defaults).map(([role,modelId])=>[role,{accessProvider:'xai',modelId}])),
+    credentialProviders: [], apiKeys: {}, arkProbes: [], arkVerification: {},
+  }))
+  assert.ok(screen.getByRole('button', { name: 'SpaceXAI' }))
+  assert.equal(screen.queryByRole('button', { name: 'Anthropic Claude' }), null)
+  assert.equal(screen.queryByRole('button', { name: 'Recraft' }), null)
+  assert.equal(screen.queryByRole('button', { name: 'DeepSeek' }), null)
+  assert.doesNotMatch(container.textContent, /未实测/)
+})
+
+test('professional model picker selects native vector routes and hides text-only channels for the image role', async () => {
+  const user = userEvent.setup()
+  const choices = []
+  render(React.createElement(ModelPicker, {
+    label: '图像生成模型', role: 'image', outputFormat: 'svg',
+    route: { accessProvider: 'recraft', modelId: 'recraftv4_1_vector' },
+    onRouteChange: (route) => choices.push(route),
+    providerConfigs: { recraft: { label: 'Recraft' }, anthropic: { label: 'Anthropic Claude' } },
+    registry: { providers: {
+      recraft: { accessKind: 'direct', models: [{ id: 'recraftv4_1_vector', label: 'Recraft V4.1 Vector', vendor: 'Recraft', roles: ['image'], selectable: true, verificationState: 'catalog', capabilities: { outputFormats: ['png', 'svg'] } }] },
+      anthropic: { accessKind: 'direct', models: [{ id: 'claude-fable-5-1', label: 'Claude Fable 5.1', roles: ['main', 'vision'], selectable: true }] },
+    } },
+  }))
+  await user.click(screen.getByRole('button', { name: '图像生成模型' }))
+  assert.ok(screen.getByRole('button', { name: 'Recraft' }))
+  assert.equal(screen.queryByRole('button', { name: 'Anthropic Claude' }), null)
+  const option = screen.getAllByText('Recraft V4.1 Vector').map((element) => element.closest('button')).find((button) => button?.classList.contains('model-option-select'))
+  assert.ok(option)
+  await user.click(option)
+  assert.deepEqual(choices, [{ accessProvider: 'recraft', modelId: 'recraftv4_1_vector' }])
+})
+
+test('rendered version labels remain separate from the selected API model ID', async () => {
+  const { STATIC_MODEL_REGISTRY } = await import('../src/lib/staticModelCatalog.js')
+  const changes=[]
+  const originalMatchMedia=window.matchMedia
+  window.matchMedia=()=>({matches:false,addEventListener(){},removeEventListener(){}})
+  try {
+    const view=render(React.createElement(ModelPicker,{
+      label:'主模型',role:'main',provider:'deepseek',value:'deepseek-v4-pro',
+      models:STATIC_MODEL_REGISTRY.deepseek.models,onChange:value=>changes.push(value),
+    }))
+    await userEvent.setup().click(screen.getByRole('button',{name:'主模型'}))
+    const selector=screen.getByRole('button',{name:'选择 DeepSeek-V4.1-Flash',exact:true})
+    assert.doesNotMatch(view.container.textContent,/滚动别名/)
+    assert.equal(view.container.querySelector('.model-id-row'),null)
+    assert.doesNotMatch(view.container.textContent,/国内|国外/)
+    assert.ok(screen.getByRole('button',{name:'选择 DeepSeek V4 Pro',exact:true}))
+    await userEvent.setup().click(selector)
+    assert.deepEqual(changes,['deepseek-flash'])
+  } finally {window.matchMedia=originalMatchMedia}
+})

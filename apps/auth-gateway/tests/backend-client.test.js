@@ -1,0 +1,227 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import { BackendError, createBackendClient } from '../src/backend-client.js';
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+test('Node transport uses the internal header and strips caller service tokens', async () => {
+  let captured;
+  const client = createBackendClient({
+    mode: 'node',
+    url: 'http://core/paperbanana-api',
+    timeoutMs: 500,
+    gatewayToken: 'server-gateway-token',
+    adminToken: 'server-admin-token',
+    fetchImpl: async (url, init) => {
+      captured = { url, init, body: JSON.parse(init.body) };
+      return jsonResponse({ code: 0, ok: true });
+    },
+  });
+
+  await client.call(
+    { action: 'createJob', gatewayToken: 'forged', adminToken: 'forged-admin', value: 1 },
+    { clientIp: '203.0.113.8', userAgent: 'safe-agent' },
+  );
+
+  assert.equal(captured.url, 'http://core/paperbanana-api');
+  assert.equal(captured.init.headers['x-paperbanana-gateway-token'], 'server-gateway-token');
+  assert.equal(captured.init.headers['x-paperbanana-client-ip'], '203.0.113.8');
+  assert.equal(captured.init.headers['user-agent'], 'safe-agent');
+  assert.equal(captured.body.gatewayToken, undefined);
+  assert.equal(captured.body.adminToken, undefined);
+  assert.equal(captured.body.value, 1);
+  assert.equal(captured.init.headers['x-forwarded-for'], undefined);
+  assert.equal(captured.init.headers['x-real-ip'], undefined);
+});
+
+test('Node admin transport uses a distinct assertion and immutable admin id', async () => {
+  let captured;
+  const client = createBackendClient({
+    mode: 'node', url: 'http://core/paperbanana-api', timeoutMs: 500,
+    gatewayToken: 'gateway', adminTransportToken: 'admin-transport',
+    fetchImpl: async (_url, init) => { captured = init; return jsonResponse({ code: 0 }); },
+  });
+  await client.call({ action: 'adminBenchmarkPublish' }, {}, { adminAction: true, adminUserId: 'immutable-admin-id' });
+  assert.equal(captured.headers['x-paperbanana-admin-transport-token'], 'admin-transport');
+  assert.equal(captured.headers['x-paperbanana-admin-user-id'], 'immutable-admin-id');
+});
+
+test('retired backend mode fails before transmitting credentials', async () => {
+  let calls = 0;
+  const client = createBackendClient({ mode: 'laf', url: 'https://retired.example/api', gatewayToken: 'secret', fetchImpl: async () => { calls++; } });
+  await assert.rejects(client.call({ action: 'createJob' }), { code: 'BACKEND_CONFIG_INVALID' });
+  await assert.rejects(client.ready(), { code: 'BACKEND_CONFIG_INVALID' });
+  assert.equal(calls, 0);
+});
+
+test('relays upstream HTTP status and JSON envelope without flattening business codes', async () => {
+  const client = createBackendClient({
+    mode: 'node',
+    url: 'http://core/paperbanana-api',
+    timeoutMs: 500,
+    gatewayToken: 'token',
+    fetchImpl: async () => jsonResponse({ code: 429, error: 'busy' }, 200),
+  });
+
+  assert.deepEqual(await client.call({ action: 'createJob' }), {
+    status: 200,
+    data: { code: 429, error: 'busy' },
+  });
+});
+
+test('maps network failures to a typed 502', async () => {
+  const client = createBackendClient({
+    mode: 'node',
+    url: 'http://core/paperbanana-api',
+    timeoutMs: 500,
+    gatewayToken: 'token',
+    fetchImpl: async () => {
+      throw new TypeError('connect failed');
+    },
+  });
+
+  await assert.rejects(
+    () => client.call({ action: 'health' }),
+    (error) => error instanceof BackendError && error.status === 502 && error.code === 'BACKEND_UNAVAILABLE',
+  );
+});
+
+test('aborts expired requests and maps them to a typed 504', async () => {
+  const client = createBackendClient({
+    mode: 'node',
+    url: 'http://core/paperbanana-api',
+    timeoutMs: 10,
+    gatewayToken: 'token',
+    fetchImpl: async (_url, init) =>
+      new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      }),
+  });
+
+  await assert.rejects(
+    () => client.call({ action: 'health' }),
+    (error) => error instanceof BackendError && error.status === 504 && error.code === 'BACKEND_TIMEOUT',
+  );
+});
+
+test('per-call timeout overrides control aborts while calls without an override keep the default', async () => {
+  let requestCount = 0;
+  const client = createBackendClient({
+    mode: 'node',
+    url: 'http://core/paperbanana-api',
+    timeoutMs: 10,
+    gatewayToken: 'token',
+    fetchImpl: async (_url, init) => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        return new Promise((resolve, reject) => {
+          const complete = setTimeout(() => resolve(jsonResponse({ code: 0 })), 25);
+          init.signal.addEventListener('abort', () => {
+            clearTimeout(complete);
+            reject(init.signal.reason);
+          }, { once: true });
+        });
+      }
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+      });
+    },
+  });
+
+  assert.deepEqual(
+    await client.call({ action: 'optimizeInputs' }, {}, { timeoutMs: 500 }),
+    { status: 200, data: { code: 0 } },
+  );
+  await assert.rejects(
+    () => client.call({ action: 'modelRegistry' }),
+    (error) => error instanceof BackendError && error.status === 504 && error.code === 'BACKEND_TIMEOUT',
+  );
+});
+
+test('rejects unsafe per-call timeout overrides', async () => {
+  const client = createBackendClient({
+    mode: 'node',
+    url: 'http://core/paperbanana-api',
+    timeoutMs: 500,
+    gatewayToken: 'token',
+    fetchImpl: async () => jsonResponse({ code: 0 }),
+  });
+
+  await assert.rejects(
+    () => client.call({ action: 'optimizeInputs' }, {}, { timeoutMs: 120_001 }),
+    (error) => error instanceof BackendError && error.status === 500 && error.code === 'BACKEND_TIMEOUT_INVALID',
+  );
+});
+
+test('Node readiness calls the protected core GET /ready and requires ready true', async () => {
+  const requests = [];
+  const client = createBackendClient({
+    mode: 'node',
+    url: 'http://core:3006/paperbanana-api',
+    timeoutMs: 500,
+    gatewayToken: 'gateway-token',
+    fetchImpl: async (url, init) => {
+      requests.push({ url, init });
+      return jsonResponse({ ready: true, dependencies: { mongodb: 'ready', oss: 'ready' } });
+    },
+  });
+
+  const result = await client.ready({ clientIp: '203.0.113.30' });
+  assert.equal(result.ok, true);
+  assert.equal(requests[0].url, 'http://core:3006/ready');
+  assert.equal(requests[0].init.method, 'GET');
+  assert.equal(requests[0].init.body, undefined);
+  assert.equal(requests[0].init.headers['x-paperbanana-gateway-token'], 'gateway-token');
+  assert.equal(client.cachedStatus().ok, true);
+});
+
+test('Node readiness rejects ready false or a non-success HTTP status', async () => {
+  for (const [status, body] of [
+    [200, { ready: false }],
+    [503, { ready: true }],
+  ]) {
+    const client = createBackendClient({
+      mode: 'node',
+      url: 'http://core:3006/paperbanana-api',
+      timeoutMs: 500,
+      gatewayToken: 'gateway-token',
+      fetchImpl: async () => jsonResponse(body, status),
+    });
+    const result = await client.ready();
+    assert.equal(result.ok, false);
+    assert.equal(client.cachedStatus().ok, false);
+  }
+});
+
+
+
+test('business envelopes never poison or heal probe-derived readiness', async () => {
+  let readinessHealthy = true;
+  const client = createBackendClient({
+    mode: 'node',
+    url: 'http://core:3006/paperbanana-api',
+    timeoutMs: 500,
+    gatewayToken: 'gateway-token',
+    fetchImpl: async (_url, init) => {
+      if (init.method === 'GET') return jsonResponse({ ready: readinessHealthy });
+      return jsonResponse(readinessHealthy ? { code: 429, error: 'busy' } : { code: 0, ok: true });
+    },
+  });
+
+  await client.ready();
+  const healthySnapshot = client.cachedStatus();
+  await client.call({ action: 'createJob' });
+  assert.deepEqual(client.cachedStatus(), healthySnapshot);
+
+  readinessHealthy = false;
+  await client.ready();
+  const unhealthySnapshot = client.cachedStatus();
+  await client.call({ action: 'createJob' });
+  assert.deepEqual(client.cachedStatus(), unhealthySnapshot);
+});

@@ -1,0 +1,190 @@
+import { useAppLocale } from './BenchmarkLocale.jsx'
+import { TokenDanceStatus } from './TokenDancePanel'
+import { MODEL_CHANNEL_LABELS, orderModelChannels } from '../lib/modelPresentation'
+import { MINIMAX_REGIONS, minimaxRegion } from '../lib/providerRegions'
+import { KeyRound, Loader2, Settings2, ShieldCheck, Sparkles } from 'lucide-react'
+import ApiKeyGuide from './ApiKeyGuide'
+import ModelPicker from './ModelPicker'
+import ModelRegistryNotice from './ModelRegistryNotice.jsx'
+import { arkVerificationKey, providerDefaultRoutes } from '../lib/modelRouting'
+
+function providerLabel(provider, providerConfigs) {
+  if (MODEL_CHANNEL_LABELS[provider]) return MODEL_CHANNEL_LABELS[provider]
+  return providerConfigs[provider]?.label || provider
+}
+
+function probeRoleLabel(role) {
+  if (role === 'image') return '图像生成'
+  if (role === 'vision') return '参考图识别'
+  return '主模型'
+}
+
+export default function ModelRoutingSettings({
+  catalogControls,
+  configurationMode,
+  visionMode = 'assist', onVisionModeChange, visionNotice,
+  renderUniversalSettings, universalSummaries, renderThinkingSettings,
+  onModeChange,
+  simpleProvider,
+  onSimpleProviderChange,
+  modelRoutes,
+  onRouteChange,
+  modelRegistry,
+  registryStatus = modelRegistry ? 'ready' : 'loading',
+  onRetryRegistry,
+  providerConfigs,
+  outputFormat,
+  operation = 'generation',
+  executionRouteRoles = [],
+  credentialProviders,
+  apiKeys,
+  tokenDance,
+  onOpenAccount,
+  onApiKeyChange,
+  providerRegions,
+  onMiniMaxRegionChange,
+  arkProbes,
+  arkVerification,
+  arkProbePaidConfirmed,
+  onArkProbePaidConfirmedChange,
+  isVerifyingArk,
+  arkVerificationError,
+  onVerifyArk,
+}) {
+  const { t } = useAppLocale()
+  const recoverableCredentials = Number(modelRegistry?.thinkingContractVersion) >= 1 || credentialProviders.some(provider => ['tokendance','fal','replicate','runware','tokenhub','xiaomi','sensenova','stepfun','qianfan','iflytek','longcat','antling','custom','xai'].includes(provider))
+  const isAdvancedMode = configurationMode === 'advanced'
+  const routeContractSupported = Number(modelRegistry?.routeContractVersion || 0) >= 1
+  const arkImageProbeRequired = arkProbes.some((probe) => probe.role === 'image')
+  const arkKeyMissing = arkProbes.length > 0 && !apiKeys.ark?.trim()
+  const verifiableArkProbes = arkProbes.filter((probe) => arkVerification[arkVerificationKey(probe)] !== 'verified'
+    && (probe.role !== 'image' || arkProbePaidConfirmed))
+
+  return (
+    <>
+      <div className="field" data-focus-setting="configuration-mode" tabIndex={-1}>
+        <span>{t("使用模式")}</span>
+        <div className="mode-switch" role="group" aria-label={t("使用模式")}>
+          <button type="button" aria-pressed={!isAdvancedMode} className={!isAdvancedMode ? 'active' : ''} onClick={() => onModeChange('simple')}>
+            <Sparkles size={16} /><span>{t("普通模式")}</span><small>{t("预设渠道 · 单 Key")}</small>
+          </button>
+          <button type="button" aria-pressed={isAdvancedMode} className={isAdvancedMode ? 'active' : ''} onClick={() => onModeChange('advanced')}>
+            <Settings2 size={16} /><span>{t("专业模式")}</span><small>{t("分角色选择渠道与模型")}</small>
+          </button>
+        </div>
+        <ModelRegistryNotice status={registryStatus} supported={!isAdvancedMode || routeContractSupported} onRetry={onRetryRegistry} unsupportedMessage="当前后端不支持专业模式的多渠道路由，请切回普通模式。" />
+      </div>
+
+      {!isAdvancedMode ? (
+        <div className="field" data-focus-setting="provider" tabIndex={-1}>
+          <span>{t("API 接入渠道")}</span>
+          <small>{t("更多渠道可在专业模式中分别选择主模型、图像模型和视觉模型。")}</small>
+          <div data-focus-setting="main-model" tabIndex={-1}>
+            <div className="segmented provider-segmented" role="group" aria-label={t("API 接入渠道")}>
+              {orderModelChannels(Object.keys(providerConfigs)).filter(id => providerDefaultRoutes(id, modelRegistry, providerConfigs)).map(id => (
+                <button
+                  type="button"
+                  key={id}
+                  className={simpleProvider === id ? 'active' : ''}
+                  aria-pressed={simpleProvider === id}
+                  disabled={Boolean(modelRegistry && !modelRegistry.providers?.[id])}
+                  title={modelRegistry?.unavailableProviders?.[id] || ''}
+                  onClick={() => onSimpleProviderChange(id)}
+                >
+                  {providerLabel(id, providerConfigs)}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      ) : null}
+      <div className="model-grid model-route-grid">
+        {[['main','主模型','main-model'],['image','图像生成模型','image-model'],['vision','视觉模型','vision-model']].filter(([role]) => (role!=='image'||executionRouteRoles.includes('image')) && (isAdvancedMode || role !== 'vision' || visionMode !== 'none')).map(([role,label,focusSetting]) => {
+          const route = modelRoutes[role]
+          const model = modelRegistry?.providers?.[route.accessProvider]?.models?.find(entry => entry.id === route.modelId)
+          return <div className="model-role-settings" data-model-role={role} key={role}>
+            {isAdvancedMode ? <ModelPicker label={t(label)} role={role} route={route} operation={operation}
+              visionMode={role === 'vision' ? visionMode : undefined} onVisionModeChange={role === 'vision' ? onVisionModeChange : undefined}
+              outputFormat={role === 'image' && !executionRouteRoles.includes('image') ? '' : outputFormat}
+              registry={modelRegistry} catalogControls={catalogControls} providerConfigs={providerConfigs} providerRegions={providerRegions} allowCustom
+              renderCustomSettings={() => renderUniversalSettings?.(role)} customSummary={universalSummaries?.[role]}
+              onRouteChange={next => {if(role === 'vision')onVisionModeChange?.('assist');onRouteChange(role,next)}} focusSetting={focusSetting} />
+              : <div className="simple-model-summary"><span>{t(label)}</span><strong>{model?.label || route.modelId}</strong>{role === 'main' && visionMode === 'none' ? <small>{t('同时负责图片理解')}</small> : role === 'vision' ? <small>{t('自动辅助主模型理解图片')}</small> : null}</div>}
+            {!(role === 'vision' && visionMode === 'none') && route.accessProvider !== 'custom' && renderThinkingSettings?.(role)}
+          </div>
+        })}
+      </div>
+
+      {isAdvancedMode && visionNotice ? <p className="vision-role-note" role="note">{t(visionNotice)}</p> : null}
+
+      {credentialProviders.some(provider => provider !== 'custom') && <details className="api-keys-panel access-credentials" data-focus-setting="api-key" open>
+        <summary><KeyRound size={17} />{t(" 接入凭据")}</summary>
+        <p>{t("填写当前任务所需的渠道密钥，或连接观猹 TokenDance 授权账户。")}{t(recoverableCredentials ? '可恢复任务所需的其他渠道密钥会在服务端加密保存，任务完成即删除，最长保留 7 天。' : '手动填写的密钥只保留在本页内存中。')}</p>
+        {credentialProviders.map((provider) => {
+          const config = providerConfigs[provider]
+          if (!config) return null
+          if (provider === 'tokendance') return tokenDance ? <TokenDanceStatus key={provider} controller={tokenDance} onOpenAccount={onOpenAccount} /> : <p key={provider}>{t("请连接观猹 TokenDance 账户。")}</p>
+          const label = providerLabel(provider, providerConfigs)
+          return (
+            <div className="credential-provider" key={provider}>
+              {provider === 'minimax' ? <label className="field">
+                <span>{t("稀宇科技区域")}</span>
+                <select aria-label={t("稀宇科技区域")} value={minimaxRegion(providerRegions)} onChange={event => onMiniMaxRegionChange(event.target.value)}>
+                  {Object.entries(MINIMAX_REGIONS).map(([id, region]) => <option key={id} value={id} disabled={id === 'cn' && !modelRegistry?.providerRegionContractVersion}>{t(region.label)}</option>)}
+                </select>
+                <small>{MINIMAX_REGIONS[minimaxRegion(providerRegions)].apiBase}{t(" · 请填写该区域平台的 Key")}</small>
+              </label> : null}
+              <label className="field">
+                <span>{t(label)}{t(" 接入密钥")}</span>
+                <div className="key-input">
+                  <KeyRound size={18} />
+                  <input
+                    type="password"
+                    aria-label={t("{v0} 接入密钥", {v0: label})}
+                    value={apiKeys[provider] || ''}
+                    onChange={(event) => onApiKeyChange(provider, event.target.value)}
+                    placeholder={config.keyPlaceholder}
+                    autoComplete="off"
+                  />
+                </div>
+              </label>
+              <ApiKeyGuide recoverable={recoverableCredentials} providerConfig={provider === 'minimax' ? {...config, guideUrl: MINIMAX_REGIONS[minimaxRegion(providerRegions)].keyUrl, guideSteps: ['登录所选区域的 稀宇科技（MiniMax）开放平台并创建 API Key。', '不同区域的 Key 分别保存在当前页面内存，切换时不会互用。']} : config} />
+            </div>
+          )
+        })}
+        {!credentialProviders.length ? <p className="credential-empty">{t("当前配置没有需要由浏览器提供的模型凭据。")}</p> : null}
+
+        {arkProbes.length ? (
+          <section className="ark-verification" aria-label={t("Ark 所选模型验证")}>
+            <div className="ark-verification-head"><ShieldCheck size={17} /><strong>{t("Ark 模型验证（可选）")}</strong></div>
+            <p>{t("完整激活目录需 AK/SK；这里的推理探针只用于提前诊断账号可用性，不是提交前置条件。验证结果和 Key 都只保留在页面内存中。")}</p>
+            <ul>
+              {arkProbes.map((probe) => (
+                <li key={arkVerificationKey(probe)}>
+                  <span>{probeRoleLabel(probe.role)} · {probe.modelId}</span>
+                  <em className={arkVerification[arkVerificationKey(probe)] || 'pending'}>
+                    {t(arkVerification[arkVerificationKey(probe)] === 'verified' ? '已验证' : arkVerification[arkVerificationKey(probe)] || '待验证')}
+                  </em>
+                </li>
+              ))}
+            </ul>
+            {arkImageProbeRequired ? (
+              <label className="ark-paid-confirmation">
+                <input type="checkbox" checked={arkProbePaidConfirmed} onChange={(event) => onArkProbePaidConfirmedChange(event.target.checked)} />
+                <span>{t("会按所选图片模型的最低支持分辨率产生一次图片调用费用")}</span>
+              </label>
+            ) : null}
+            <button
+              type="button"
+              className="secondary-button ark-verify-button"
+              disabled={isVerifyingArk || arkKeyMissing || !verifiableArkProbes.length}
+              onClick={onVerifyArk}
+            >
+              {isVerifyingArk ? <Loader2 className="spin" size={16} /> : <ShieldCheck size={16} />}{t("验证所选模型")}</button>
+            {arkVerificationError ? <p className="ark-verification-error">{arkVerificationError}</p> : null}
+          </section>
+        ) : null}
+      </details>}
+    </>
+  )
+}

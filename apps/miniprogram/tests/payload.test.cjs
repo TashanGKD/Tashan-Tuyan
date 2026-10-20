@@ -1,0 +1,106 @@
+const assert = require('node:assert/strict')
+
+const { buildCreateJobPayload } = require('../miniprogram/utils/payload.js')
+
+const baseInput = {
+  configurationMode: 'advanced',
+  provider: 'bailian',
+  registry: { routeContractVersion: 1 },
+  modelRoutes: {
+    main: { accessProvider: 'openai', modelId: 'gpt-main' },
+    image: { accessProvider: 'bailian', modelId: 'wan-image' },
+    vision: { accessProvider: 'gemini', modelId: 'gemini-vision' },
+  },
+  apiKeys: { openai: ' openai-key ', bailian: ' bailian-key ', gemini: ' gemini-key ', ark: 'unused' },
+  categoryId: 'method_framework',
+  categoryLabel: '方法框架图',
+  methodContent: ' 这是一段足够长的方法内容描述。 ',
+  caption: ' 图 1：总览。 ',
+  negativePrompt: ' 避免小字。 ',
+  outputFormat: 'png',
+  imageSize: '2K',
+  referenceImageMode: 'vision_model',
+  uploadedReferenceImages: [],
+  pipelineMode: 'planner_critic',
+  retrievalSetting: 'manual',
+  manualReferenceIds: ['ref-1', 'ref-2'],
+  aspectRatio: '21:9',
+  numCandidates: 2,
+  maxCriticRounds: 2,
+}
+
+// 专业模式 + 手动参考：透传 retrievalSetting 与 manualReferenceIds
+const advanced = buildCreateJobPayload(baseInput)
+assert.equal(advanced.action, 'createJob')
+assert.equal(advanced.clientPlatform, 'miniprogram')
+assert.equal(advanced.taskName, 'diagram')
+assert.equal(advanced.imageSize, '2K')
+assert.equal(advanced.retrievalSetting, 'manual')
+assert.deepEqual(advanced.manualReferenceIds, ['ref-1', 'ref-2'])
+assert.equal(advanced.referenceImageMode, undefined)
+assert.deepEqual(advanced.apiKeys, { openai: 'openai-key', bailian: 'bailian-key', gemini: 'gemini-key' })
+assert.equal(advanced.methodContent, '这是一段足够长的方法内容描述。')
+assert.equal(advanced.negativePrompt, '避免小字。')
+assert.deepEqual(advanced.modelRoutes, baseInput.modelRoutes)
+assert.equal(advanced.provider, 'openai')
+assert.equal(advanced.mainModelName, 'gpt-main')
+assert.equal(advanced.imageModelName, 'wan-image')
+assert.equal(advanced.referenceVisionModelName, 'gemini-vision')
+assert.equal(advanced.aspectRatio, '21:9')
+assert.equal(advanced.numCandidates, 2)
+
+// 上传参考图 ⇒ 检索强制关闭（与后端归一化语义一致，SYNC.md 2026-06-09）
+const withRefs = buildCreateJobPayload({
+  ...baseInput,
+  uploadedReferenceImages: [
+    { filename: 'ref.png', mimeType: 'image/png', size: 1024, objectKey: 'k', uploadToken: 't' },
+  ],
+})
+assert.equal(withRefs.retrievalSetting, 'none')
+assert.deepEqual(withRefs.manualReferenceIds, [])
+assert.equal(withRefs.referenceImageMode, 'vision_model')
+
+// 数据统计类别 ⇒ taskName = 'plot'
+const plot = buildCreateJobPayload({ ...baseInput, categoryId: 'data_stat', categoryLabel: '数据统计图' })
+assert.equal(plot.taskName, 'plot')
+
+// 普通模式同样允许配置流程、检索、候选与评审，只限制模型路由为单渠道。
+const simple = buildCreateJobPayload({ ...baseInput, configurationMode: 'simple' })
+assert.equal(simple.pipelineMode, 'planner_critic')
+assert.equal(simple.retrievalSetting, 'manual')
+assert.deepEqual(simple.manualReferenceIds, ['ref-1', 'ref-2'])
+assert.equal(simple.aspectRatio, '21:9')
+assert.equal(simple.numCandidates, 2)
+assert.equal(simple.maxCriticRounds, 2)
+// imageSize 普通模式同样生效（web 端清晰度对两种模式都可见）
+assert.equal(simple.imageSize, '2K')
+
+// A stale selection must not escape through the request builder after a catalog refresh.
+const registry = { routeContractVersion: 1, providers: { bailian: { models: [{ id: 'wan-image', capabilities: {
+  resolutions: ['1K', '2K'], aspectRatiosByResolution: { '1K': ['1:1'], '2K': ['1:1', '21:9'] },
+} }] } } }
+for (const [role, route] of Object.entries(baseInput.modelRoutes)) {
+  const provider = registry.providers[route.accessProvider] ||= { models: [] }
+  let model = provider.models.find(m => m.id === route.modelId)
+  if (!model) provider.models.push(model = { id: route.modelId, capabilities: {} })
+  Object.assign(model, { selectable: true, roles: [role] })
+}
+assert.equal(buildCreateJobPayload({ ...baseInput, registry }).aspectRatio, '21:9')
+assert.throws(() => buildCreateJobPayload({ ...baseInput, registry, imageSize: '1K' }), /当前比例或清晰度不可用/)
+assert.throws(() => buildCreateJobPayload({ ...baseInput, registry, imageSize: '4K', aspectRatio: 'auto' }), /当前比例或清晰度不可用/)
+assert.equal(buildCreateJobPayload({ ...baseInput, registry, imageSize: '1K', aspectRatio: 'auto' }).aspectRatio, 'auto')
+
+const vector = {
+  ...baseInput, outputFormat: 'svg', pipelineMode: 'vanilla', aspectRatio: '9:22',
+  modelRoutes: { ...baseInput.modelRoutes, image: { accessProvider: 'recraft', modelId: 'recraftv4_vector' } },
+  registry: { routeContractVersion: 1, providers: { recraft: { models: [{ id: 'recraftv4_vector', capabilities: { resolutions: ['2K'], aspectRatios: ['1:1'] } }] } } },
+}
+for (const [role, route] of Object.entries(vector.modelRoutes)) {
+  const provider = vector.registry.providers[route.accessProvider] ||= { models: [] }
+  let model = provider.models.find(m => m.id === route.modelId)
+  if (!model) provider.models.push(model = { id: route.modelId, capabilities: {} })
+  Object.assign(model, { selectable: true, roles: [role] })
+}
+assert.throws(() => buildCreateJobPayload(vector), /当前比例或清晰度不可用/)
+assert.equal(buildCreateJobPayload({ ...vector, aspectRatio: '1:1' }).aspectRatio, '1:1')
+console.log('payload.test.cjs passed')

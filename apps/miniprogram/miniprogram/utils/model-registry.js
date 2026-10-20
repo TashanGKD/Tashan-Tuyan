@@ -1,0 +1,216 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.MODEL_PROVIDER_IDS = void 0;
+exports.normalizeModelRegistry = normalizeModelRegistry;
+exports.modelAvailabilityPresentation = modelAvailabilityPresentation;
+exports.partitionRegistryModels = partitionRegistryModels;
+exports.groupRegistryModels = groupRegistryModels;
+exports.findRegistryModel = findRegistryModel;
+const model_presentation_1 = require("./model-presentation");
+exports.MODEL_PROVIDER_IDS = ['gemini', 'openai', 'bailian', 'ark', 'openrouter', 'deepseek', 'kimi', 'zhipu', 'siliconflow', 'anthropic', 'recraft', 'xai', 'bfl', 'stability', 'ideogram', 'minimax', 'mistral', 'together', 'fireworks', 'fal', 'replicate', 'runware', 'tokenhub', 'xiaomi', 'sensenova', 'stepfun', 'qianfan', 'iflytek', 'longcat', 'antling', 'novita', 'tokendance'];
+function normalizeModelRegistry(input) {
+    const source = asRecord(input);
+    const registryVersion = stringValue(source.registryVersion);
+    const routeContractVersion = numberValue(source.routeContractVersion);
+    if (!registryVersion)
+        throw new Error('服务端模型目录缺少版本。');
+    if (routeContractVersion < 1 || source.supportsModelRoutes !== true) {
+        throw new Error('服务端模型路由契约不可用。');
+    }
+    const providerSource = asRecord(source.providers);
+    const missingProviders = ['gemini', 'openai', 'bailian', 'ark', 'openrouter'].filter((id) => !providerSource[id]);
+    if (missingProviders.length)
+        throw new Error('服务端模型目录必须包含五个 API 渠道。');
+    const providers = {};
+    for (const providerId of exports.MODEL_PROVIDER_IDS) {
+        if (providerSource[providerId])
+            providers[providerId] = normalizeProvider(providerId, providerSource[providerId]);
+    }
+    const upload = asRecord(source.refineUpload);
+    const positive = (value) => Number.isFinite(Number(value)) && Number(value) > 0;
+    const refineUpload = [1, 2].includes(Number(upload.version)) && Array.isArray(upload.mimeTypes) && upload.mimeTypes.length > 0 && [upload.maxBytes, upload.maxDimension, upload.maxPixels].every(positive)
+        ? { version: Number(upload.version), mimeTypes: stringArray(upload.mimeTypes).filter(mime => ['image/png', 'image/jpeg', 'image/webp'].includes(mime)), maxBytes: Number(upload.maxBytes), maxDimension: Number(upload.maxDimension), maxPixels: Number(upload.maxPixels), modelMaxBytes: Object.fromEntries(Object.entries(asRecord(upload.modelMaxBytes)).filter(([, value]) => positive(value)).map(([key, value]) => [key, Number(value)])) }
+        : undefined;
+    const referenceUpload = source.referenceUpload && typeof source.referenceUpload === 'object' ? asRecord(source.referenceUpload) : undefined;
+    return { catalogWarnings: asRecord(source.catalogWarnings), unavailableProviders: asRecord(source.unavailableProviders), ...(referenceUpload ? { referenceUpload: { version: numberValue(referenceUpload.version), platform: asRecord(referenceUpload.platform) } } : {}), registryVersion, routeContractVersion, providerRegionContractVersion: numberValue(source.providerRegionContractVersion), supportsModelRoutes: true, providers,
+        inputOptimizationContractVersion: numberValue(source.inputOptimizationContractVersion),
+        ...(Array.isArray(source.inputOptimizationTargets) ? { inputOptimizationTargets: stringArray(source.inputOptimizationTargets) } : {}),
+        ...((refineUpload === null || refineUpload === void 0 ? void 0 : refineUpload.mimeTypes.length) ? { refineUpload } : {}),
+    };
+}
+function normalizeProvider(providerId, input) {
+    const source = asRecord(input);
+    const defaultsSource = asRecord(source.defaults);
+    const modelsSource = Array.isArray(source.models) ? source.models : [];
+    if (!modelsSource.length)
+        throw new Error(`${providerId} 模型目录为空。`);
+    const models = (0, model_presentation_1.sortModelsNewestFirst)(modelsSource.map((model) => (0, model_presentation_1.presentRegistryModel)(providerId, normalizeModel(model))));
+    const uniqueIds = new Set(models.map((model) => model.id));
+    if (uniqueIds.size !== models.length)
+        throw new Error(`${providerId} 模型目录包含重复 ID。`);
+    const defaults = {
+        main: stringValue(defaultsSource.main),
+        image: stringValue(defaultsSource.image),
+        vision: stringValue(defaultsSource.vision),
+    };
+    const labels = { main: '主模型', image: '图像模型', vision: '识别模型' };
+    for (const role of ['main', 'image', 'vision']) {
+        if (!defaults[role] && !models.some((model) => model.selectable !== false && model.roles.includes(role)))
+            continue;
+        const entry = models.find((model) => model.id === defaults[role]);
+        const catalogQuarantined = (entry === null || entry === void 0 ? void 0 : entry.selectable) === false && Boolean(entry.disabledReason);
+        if (!entry || (entry.selectable === false && !catalogQuarantined) || !entry.roles.includes(role)) {
+            throw new Error(`${providerId} 默认${labels[role]}无效。`);
+        }
+    }
+    return {
+        accessKind: stringValue(source.accessKind) || 'direct',
+        routeContractVersion: numberValue(source.routeContractVersion) || 1,
+        accountCatalogRequired: source.accountCatalogRequired === true,
+        defaults,
+        models,
+    };
+}
+function normalizeModel(input) {
+    const source = asRecord(input);
+    const id = stringValue(source.id);
+    if (!id)
+        throw new Error('模型目录包含空 ID。');
+    const roles = stringArray(source.roles).filter(isModelRole);
+    const roleReasonsSource = asRecord(source.roleReasons);
+    return {
+        id,
+        version: (0, model_presentation_1.normalizeModelVersion)(source.version),
+        apiIdentifier: stringValue(source.apiIdentifier),
+        label: stringValue(source.label) || id,
+        vendor: stringValue(source.vendor) || '其他',
+        lifecycle: stringValue(source.lifecycle) || 'unknown',
+        recommended: source.recommended === true,
+        requiresEntitlement: source.requiresEntitlement === true,
+        entitlement: stringValue(source.entitlement),
+        verified: source.verified === true,
+        verificationState: stringValue(source.verificationState) || 'unverified',
+        selectable: source.selectable !== false,
+        disabledReason: stringValue(source.disabledReason),
+        roles,
+        roleReasons: {
+            main: stringValue(roleReasonsSource.main),
+            image: stringValue(roleReasonsSource.image),
+            vision: stringValue(roleReasonsSource.vision),
+        },
+        inputModalities: stringArray(source.inputModalities),
+        outputModalities: stringArray(source.outputModalities),
+        protocol: stringValue(source.protocol),
+        availabilityNotes: stringValue(source.availabilityNotes),
+        releasedAt: validReleasedAt(source.releasedAt),
+        vendorId: stringValue(source.vendorId),
+        serviceTier: stringValue(source.serviceTier),
+        releaseKind: stringValue(source.releaseKind),
+        lifecycleSourceUrl: stringValue(source.lifecycleSourceUrl),
+        releaseFamily: stringValue(source.releaseFamily),
+        releaseOrder: numberValue(source.releaseOrder),
+        releaseSourceUrl: stringValue(source.releaseSourceUrl),
+        releaseOrderSourceUrl: stringValue(source.releaseOrderSourceUrl),
+        expirationDate: validReleasedAt(source.expirationDate),
+        expirationAt: typeof source.expirationAt === 'string' && Number.isFinite(Date.parse(source.expirationAt)) ? source.expirationAt : '',
+        earliestRetirementDate: validReleasedAt(source.earliestRetirementDate),
+        replacementModelId: stringValue(source.replacementModelId),
+        regions: stringArray(source.regions),
+        roleProtocols: asRecord(source.roleProtocols),
+        capabilities: asRecord(source.capabilities),
+    };
+}
+function modelAvailabilityPresentation(model) {
+    const lifecycleLabel = model.lifecycle === 'stable'
+        ? '稳定'
+        : model.lifecycle === 'preview'
+            ? '预览'
+            : model.lifecycle === 'deprecated'
+                ? '即将下线'
+                : '生命周期未知';
+    const state = stringValue(model.verificationState);
+    return {
+        lifecycleLabel,
+        verificationLabel: state === 'inference-verified'
+            ? '当前账号实测可用'
+            : state === 'registry' && model.verified === true
+                ? '注册表已验证'
+                : state === 'catalog'
+                    ? '官方目录'
+                    : '模型目录',
+        verifiedForAccount: state === 'inference-verified',
+    };
+}
+function partitionRegistryModels(models, options) {
+    const query = stringValue(options.query).toLocaleLowerCase('zh-CN');
+    const annotated = models
+        .filter((model) => model.selectable !== false && !(model.expirationDate && !model.expirationDate.startsWith('2098') && Date.now() >= Date.parse(model.expirationAt || `${model.expirationDate}T00:00:00Z`)))
+        .filter((model) => model.roles.includes(options.role) || Boolean(model.roleReasons[options.role]))
+        .filter((model) => !options.recommendedOnly || (model.recommended && model.lifecycle === 'stable'))
+        .filter((model) => !query || modelSearchValues(model).some((value) => value.toLocaleLowerCase('zh-CN').includes(query)))
+        .map((model) => annotateModel(model, options.role, stringValue(options.outputFormat)));
+    return {
+        compatible: (0, model_presentation_1.sortModelsNewestFirst)(annotated.filter((model) => !model.selectionDisabled)),
+        incompatible: annotated.filter((model) => Boolean(model.selectionDisabled)),
+    };
+}
+function groupRegistryModels(models) {
+    const groups = new Map();
+    for (const model of models) {
+        const vendor = (0, model_presentation_1.modelDeveloper)('', model).label;
+        const current = groups.get(vendor) || [];
+        current.push(model);
+        groups.set(vendor, current);
+    }
+    return [...groups.entries()]
+        .sort(([left], [right]) => vendorIndex(left) - vendorIndex(right) || left.localeCompare(right, 'zh-CN'))
+        .map(([vendor, vendorModels]) => ({ vendor, models: (0, model_presentation_1.sortModelsNewestFirst)(vendorModels) }));
+}
+function findRegistryModel(registry, provider, modelId) {
+    var _a;
+    if (!registry || !exports.MODEL_PROVIDER_IDS.includes(provider))
+        return null;
+    return ((_a = registry.providers[provider]) === null || _a === void 0 ? void 0 : _a.models.find((model) => model.id === modelId)) || null;
+}
+function annotateModel(model, role, outputFormat) {
+    const expired = Boolean(model.expirationDate && !model.expirationDate.startsWith('2098') && Date.now() >= Date.parse(model.expirationAt || `${model.expirationDate}T00:00:00Z`));
+    const capabilities = model.capabilities || {};
+    const formats = stringArray(capabilities.outputFormats);
+    const roleMismatch = !model.roles.includes(role);
+    const formatMismatch = role === 'image' && Boolean(outputFormat) && formats.length > 0 && !formats.includes(outputFormat);
+    return {
+        ...model,
+        selectionDisabled: expired || !model.selectable || roleMismatch || formatMismatch,
+        selectionDisabledReason: (expired ? `官方服务已于 ${model.expirationDate} 到期` : '') || model.disabledReason
+            || (roleMismatch ? model.roleReasons[role] || '服务端未授权该模型用于当前角色' : '')
+            || (formatMismatch ? `该模型不支持 ${outputFormat.toUpperCase()} 输出` : ''),
+    };
+}
+function modelSearchValues(model) {
+    return [model.id, model.label, model.vendor, model.protocol, model.availabilityNotes, model.disabledReason, ...model.roles];
+}
+const VENDOR_ORDER = ['OpenAI', 'Google', 'Anthropic', '阿里巴巴', '深度求索', '智谱', '字节跳动', 'SpaceXAI'];
+function vendorIndex(vendor) {
+    const index = VENDOR_ORDER.indexOf(vendor);
+    return index < 0 ? 999 : index;
+}
+function validReleasedAt(value) {
+    const text = stringValue(value);
+    return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : '';
+}
+function isModelRole(value) {
+    return value === 'main' || value === 'image' || value === 'vision';
+}
+function asRecord(value) {
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+function stringArray(value) {
+    return Array.isArray(value) ? value.map(stringValue).filter(Boolean) : [];
+}
+function stringValue(value) {
+    return typeof value === 'string' ? value.trim() : '';
+}
+function numberValue(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : 0;
+}

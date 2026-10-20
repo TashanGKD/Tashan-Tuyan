@@ -1,0 +1,52 @@
+{
+  "pages": [
+    "pages/index/index",
+    "pages/records/records",
+    "pages/refine/refine",
+    "pages/guide/guide",
+    "pages/job-detail/job-detail",
+    "pages/tokendance/tokendance",
+    "pages/watcha/watcha"
+  ],
+  "window": {
+    "navigationBarTextStyle": "black",
+    "navigationBarTitleText": "图研Tuyan",
+    "navigationBarBackgroundColor": "#ffffff",
+    "backgroundColor": "#f3f2ee"
+  },
+  "tabBar": {
+    "color": "#87827a",
+    "selectedColor": "#315f51",
+    "backgroundColor": "#fffffb",
+    "borderStyle": "black",
+    "list": [
+      {
+        "pagePath": "pages/index/index",
+        "text": "生成"
+      },
+      {
+        "pagePath": "pages/records/records",
+        "text": "记录"
+      },
+      {
+        "pagePath": "pages/refine/refine",
+        "text": "精修"
+      },
+      {
+        "pagePath": "pages/tokendance/tokendance",
+        "text": "账户"
+      },
+      {
+        "pagePath": "pages/guide/guide",
+        "text": "教程"
+      }
+    ]
+  },
+  "networkTimeout": {
+    "request": 60000,
+    "downloadFile": 60000
+  },
+  "style": "v2",
+  "componentFramework": "glass-easel",
+  "lazyCodeLoading": "requiredComponents"
+}

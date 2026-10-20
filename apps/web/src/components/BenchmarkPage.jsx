@@ -1,0 +1,377 @@
+import { useEffect, useMemo, useState } from 'react'
+import { ArrowLeft, ArrowRight, ArrowUpDown, BarChart3, ExternalLink, Loader2, Search } from 'lucide-react'
+import { benchmarkLeaderboardRequest } from '@paperbanana/api'
+
+import { appPath } from '../appPaths.js'
+import { LEADERBOARD_AXES, SCIENTIFIC_LEADERBOARD_AXES, leaderboardDetailHref, resolveLeaderboardRoute } from '../leaderboardRoutes.js'
+import {
+  BenchmarkCaseEvidencePage,
+  BenchmarkEvidenceImage,
+  BenchmarkModelEvidencePage,
+  BenchmarkPromptAdminPage,
+  BenchmarkPromptSubmissionForm,
+  BenchmarkPromptSubmissionPage,
+} from './BenchmarkEvidencePages.jsx'
+import { normalizeLeaderboardRelease } from './benchmarkRelease.js'
+import useCompactLayout from '../hooks/useCompactLayout.js'
+import BenchmarkPareto from './BenchmarkPareto.jsx'
+import BenchmarkRankingFilters from './BenchmarkRankingFilters.jsx'
+import { benchmarkRecordKey, benchmarkDeveloperName, matchesBenchmarkModel } from './benchmarkDevelopers.js'
+import { useBenchmarkLocale } from './BenchmarkLocale.jsx'
+
+export { BenchmarkEvidenceImage, BenchmarkPromptSubmissionForm }
+
+export const BENCHMARK_AXIS_LABELS = Object.freeze(Object.fromEntries(LEADERBOARD_AXES.map((axis) => [axis.id, axis.label])))
+
+const OVERALL_METRIC = Object.freeze({ id: 'overall', label: 'Overall' })
+const WORKSPACE_HREF = appPath('/')
+const LEADERBOARD_HREF = appPath('/leaderboard')
+const METHODOLOGY_HREF = appPath('/leaderboard/methodology')
+const SUBMIT_HREF = appPath('/leaderboard/submit-prompt')
+const LOGO_HREF = appPath('/logo.svg')
+
+function finiteNumber(value) {
+  if (value === null || value === undefined || value === '') return null
+  const numeric = Number(value)
+  return Number.isFinite(numeric) ? numeric : null
+}
+
+function formatScore(value) {
+  const numeric = finiteNumber(value)
+  return numeric === null ? '—' : numeric.toFixed(2)
+}
+
+function modelIdentity(model) {
+  return model.modelId || model.canonicalModelId || model.profileId || ''
+}
+
+function modelName(model) {
+  return model.displayName || modelIdentity(model) || '未命名模型'
+}
+
+function metricValue(model, metricId) {
+  return metricId === 'overall' ? finiteNumber(model.overallScore) : finiteNumber(model.dimensions?.[metricId]?.mean)
+}
+
+function metricRank(model, metricId) {
+  const rank = metricId === 'overall' ? finiteNumber(model.overallRank) : finiteNumber(model.dimensionRanks?.[metricId])
+  return rank === null ? null : rank
+}
+
+function axesForRelease(release) {
+  return release?.presentationVersion === 'scientific-leaderboard-v2' ? SCIENTIFIC_LEADERBOARD_AXES : LEADERBOARD_AXES
+}
+
+function rankClass(rank) {
+  return rank && rank <= 3 ? `rank-top-${rank}` : ''
+}
+
+function compareByMetric(left, right, metricId) {
+  const leftValue = metricValue(left, metricId)
+  const rightValue = metricValue(right, metricId)
+  if (leftValue === null && rightValue === null) return modelName(left).localeCompare(modelName(right), 'zh-CN')
+  if (leftValue === null) return 1
+  if (rightValue === null) return -1
+  return rightValue - leftValue || modelName(left).localeCompare(modelName(right), 'zh-CN')
+}
+
+function MetricValue({ model, metricId }) {
+  const value = metricValue(model, metricId)
+  const rank = metricRank(model, metricId)
+  if (value === null || rank === null) return '—'
+  return <span>#{rank} · {formatScore(value)}</span>
+}
+
+function LeaderboardNav() {
+  const { t, locale } = useBenchmarkLocale()
+  return (
+    <nav className="bench-nav" aria-label={t("排行榜导航")}>
+      <a className="bench-brand" href={WORKSPACE_HREF}><img src={LOGO_HREF} alt="" />{t("图研Tuyan")}</a>
+      <a href={WORKSPACE_HREF}>{t("工作台")}</a>
+      <span aria-current="page">{t("排行榜")}</span>
+      <a href={METHODOLOGY_HREF}>{t("方法说明")}</a>
+      <a href={SUBMIT_HREF}>{t("提交评估题")}</a>
+      <a href="https://github.com/yrjmdqmmx/Tuyan" target="_blank" rel="noreferrer">GitHub <ExternalLink size={12} /></a>
+    </nav>
+  )
+}
+
+function LeaderboardHero({ release, compact = false, embedded = false }) {
+  const { t, locale } = useBenchmarkLocale()
+  const phone = useCompactLayout()
+  const scientific = release.presentationVersion === 'scientific-leaderboard-v2'
+  if (embedded) return <header className="bench-workspace-hero">
+    <span className="bench-workspace-kicker">{t("TUYAN BENCHMARK")}</span>
+    <h2>{t("图研 Tuyan Benchmark")}</h2>
+    <p className="bench-workspace-subtitle">{t("科研图示生成与编辑模型基准评测")}</p>
+    <p className="bench-workspace-description">{t("面向真实科研图示任务，公开题集、评分标准、审核机制和模型证据的生成与编辑模型横向评测。")}</p>
+    <a className="bench-workspace-method" href={METHODOLOGY_HREF}>{t("查看完整方法说明")}<ArrowRight size={14}/></a>
+    <div className="bench-meta" aria-label={t("排行榜方法摘要")}>
+      <span className="accent">{release.eligibleModelCount ?? release.models?.length ?? 0} {t("个合格模型")}</span>
+      <span>{scientific ? t("固定 9 题 · 6 生成 + 3 编辑") : t("固定 4 题 · 每模型 4 张")}</span>
+      <span>{scientific ? t("独立双盲 + 争议仲裁") : t("Codex 双遍盲审")}</span>
+      <span>{scientific ? t("十维等权 · 失败记 0") : t("七维等权")}</span>
+    </div>
+  </header>
+  if (phone) return <header className="bench-phone-hero">
+    <h1>{t("模型评测排行榜")}</h1>
+    <p>{t("科研图示生成与编辑模型的能力与成本对比。")}</p>
+    <details className="bench-phone-method">
+      <summary>{t("评测说明")}<span>{release.eligibleModelCount ?? release.models?.length ?? 0} {t("个模型")}</span></summary>
+      <div><p>{t("面向真实科研图示任务，公开题集、评分标准、审核机制和模型证据。")}</p><p>{scientific ? t("固定 9 题 · 6 生成 + 3 编辑；独立双盲 + 争议仲裁；十维等权，失败记 0。") : t("固定 4 题 · 每模型 4 张；Codex 双遍盲审；七维等权。")}</p><a href={METHODOLOGY_HREF}>{t("查看完整方法说明")}</a></div>
+    </details>
+  </header>
+  if (compact) return <header className="bench-compact-hero"><h1>{t("图研 Tuyan Benchmark")}</h1><p>{t("科研图示生成与编辑模型评测")}</p></header>
+  return (
+    <header className="bench-hero">
+      <div className="bench-eyebrow">{t("TUYAN BENCHMARK")}</div>
+      <h1>{t("图研 Tuyan Benchmark")}</h1>
+      <p className="bench-hero-subtitle">{t("科研图示生成与编辑模型基准评测")}</p>
+      <p className="bench-hero-subtitle-en"><em>{t("Tuyan Benchmark for Scientific Figure Generation & Editing Models")}</em></p>
+      <p className="bench-hero-description">{t("面向真实科研图示任务，公开题集、评分标准、审核机制和模型证据的生成与编辑模型横向评测。")}</p>
+      <div className="bench-meta" aria-label={t("排行榜方法摘要")}>
+        <span className="accent">{release.eligibleModelCount ?? release.models?.length ?? 0} {t("个合格模型")}</span>
+        <span>{scientific ? t("固定 9 题 · 6 生成 + 3 编辑") : t("固定 4 题 · 每模型 4 张")}</span>
+        <span>{scientific ? t("独立双盲 + 争议仲裁") : t("Codex 双遍盲审")}</span>
+        <span>{scientific ? t("十维等权 · 失败记 0") : t("七维等权")}</span>
+      </div>
+    </header>
+  )
+}
+
+function DimensionCard({ axis, models }) {
+  const { t, locale } = useBenchmarkLocale()
+  const ranked = useMemo(() => [...models].sort((left, right) => compareByMetric(left, right, axis.id)).slice(0, 10), [axis.id, models])
+  return (
+    <article className="bench-dimension-card">
+      <header>
+        <div><span>{t(axis.label)}</span><small>{t("TOP10")}</small></div>
+        <strong>{t("Top10")}</strong>
+      </header>
+      <ol>
+        {ranked.map((model) => {
+          const score = metricValue(model, axis.id)
+          const rank = metricRank(model, axis.id)
+          return (
+            <li className="bench-mini-row" key={benchmarkRecordKey(model)}>
+              <b className={rankClass(rank)}>#{rank ?? '—'}</b>
+              <a href={leaderboardDetailHref(`/leaderboard/models/${encodeURIComponent(model.profileId)}`)}><strong>{modelName(model)}</strong><small>{modelIdentity(model)}</small><span className="bench-developer" title={t('模型研发厂商')}>{benchmarkDeveloperName(model, locale)}</span></a>
+              <i aria-hidden="true"><i style={{ width: `${Math.max(0, Math.min(100, (score || 0) * 10))}%` }} /></i>
+              <em>{formatScore(score)}</em>
+            </li>
+          )
+        })}
+      </ol>
+      <a href={appPath(`/leaderboard/${axis.slug}`)}>{t("查看完整排名")}<span aria-hidden="true">→</span></a>
+    </article>
+  )
+}
+
+function DimensionGrid({ axes, models, embedded = false }) {
+  const { t, locale } = useBenchmarkLocale()
+  return (
+    <section className="bench-section" aria-labelledby="bench-dimensions-title">
+      <div className="bench-section-head">
+        <div><div className="bench-eyebrow">{t("DIMENSION LEADERS")}</div><h2 id="bench-dimensions-title">{axes.length} {t("维 Top10")}</h2><p>{t(embedded ? "查看各维度表现，进入完整排名了解评分细节。" : "先看各维度强项，再进入下方综合矩阵横向比较。")}</p></div>
+      </div>
+      <div className="bench-dimension-grid">
+        {axes.map((axis) => <DimensionCard axis={axis} models={models} key={axis.id} />)}
+      </div>
+    </section>
+  )
+}
+
+function MatrixHeader({ metric, activeMetric, onSort }) {
+  const { t, locale } = useBenchmarkLocale()
+  const active = metric.id === activeMetric
+  return (
+    <th scope="col" {...(active ? { 'aria-sort': 'descending' } : {})}>
+      <button type="button" aria-label={t("按{v0}排序", {v0: t(metric.label)})} onClick={() => onSort(metric.id)}>
+        {t(metric.label)}<ArrowUpDown size={13} aria-hidden="true" />
+      </button>
+    </th>
+  )
+}
+
+function LeaderboardMatrix({ axes, models, sortMetric, setSortMetric }) {
+  const { t, locale } = useBenchmarkLocale()
+  const visibleModels = useMemo(
+    () => [...models].sort((left, right) => compareByMetric(left, right, sortMetric)),
+    [models, sortMetric],
+  )
+
+  return (
+    <section className="bench-section bench-matrix-section" aria-labelledby="bench-matrix-title">
+      <div className="bench-section-head bench-matrix-head">
+        <div><div className="bench-eyebrow">{t("OVERALL MATRIX")}</div><h2 id="bench-matrix-title">{t("综合总矩阵")}</h2><p>{t("点击指标表头即可按对应原始分数降序查看；单元格同时展示 competition rank 与得分。")}</p></div>
+      </div>
+      <div className="bench-matrix-scroll" tabIndex="0" aria-label={t("可横向滚动的综合排行榜")}>
+        <table className="bench-matrix" aria-label={t("生图模型综合排行榜")}>
+          <thead><tr>
+            <th className="bench-model-column" scope="col">{t("模型")}</th>
+            <MatrixHeader metric={OVERALL_METRIC} activeMetric={sortMetric} onSort={setSortMetric} />
+            {axes.map((axis) => <MatrixHeader metric={axis} activeMetric={sortMetric} onSort={setSortMetric} key={axis.id} />)}
+          </tr></thead>
+          <tbody>
+            {visibleModels.map((model) => (
+              <tr key={benchmarkRecordKey(model)}>
+                <th className="bench-model-column" scope="row"><a href={leaderboardDetailHref(`/leaderboard/models/${encodeURIComponent(model.profileId)}`)}><strong>{modelName(model)}</strong><small>{modelIdentity(model)}</small></a><span className="bench-developer" title={t('模型研发厂商')}>{benchmarkDeveloperName(model, locale)}</span></th>
+                <td className={rankClass(metricRank(model, 'overall'))}><MetricValue model={model} metricId="overall" /></td>
+                {axes.map((axis) => <td className={rankClass(metricRank(model, axis.id))} key={axis.id}><MetricValue model={model} metricId={axis.id} /></td>)}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {visibleModels.length === 0 ? <div className="bench-empty">{t("没有匹配的合格模型。")}</div> : null}
+      </div>
+    </section>
+  )
+}
+
+function DimensionLeaderboard({ axis, release, models, allModels, filters, showNavigation = true }) {
+  const { t, locale } = useBenchmarkLocale()
+  const ranked = useMemo(
+    () => [...models].sort((left, right) => compareByMetric(left, right, axis.id)),
+    [axis.id, models],
+  )
+  return (
+    <main className="bench-shell">
+      {showNavigation ? <LeaderboardNav /> : null}
+      <section className="bench-subpage-hero">
+        <a href={LEADERBOARD_HREF}><ArrowLeft size={15} />{t("返回综合总榜")}</a>
+        <div className="bench-eyebrow">{t("FULL DIMENSION RANKING")}</div>
+        <h1>{t(axis.label)}{t("完整排名")}</h1>
+        <p>{t("全部")}{release.eligibleModelCount ?? models.length} {t("个合格模型，按原始均分降序排列。")}</p>
+      </section>
+      <BenchmarkRankingFilters models={allModels} count={models.length} {...filters} />
+      <section className="bench-dimension-full">
+        <div className="bench-matrix-scroll" tabIndex="0" aria-label={t("可横向滚动的{v0}完整排名", {v0: t(axis.label)})}>
+          <table className="bench-dimension-table" aria-label={t("{v0}完整排名", {v0: t(axis.label)})}>
+            <thead><tr><th scope="col">{t("名次")}</th><th scope="col">{t("模型")}</th><th scope="col">{t("分数")}</th></tr></thead>
+            <tbody>{ranked.map((model) => {
+              const rank = metricRank(model, axis.id)
+              return <tr key={benchmarkRecordKey(model)}><td className={rankClass(rank)}>#{rank ?? '—'}</td><th scope="row"><a href={leaderboardDetailHref(`/leaderboard/models/${encodeURIComponent(model.profileId)}`)}><strong>{modelName(model)}</strong><small>{modelIdentity(model)}</small></a><span className="bench-developer" title={t('模型研发厂商')}>{benchmarkDeveloperName(model, locale)}</span></th><td>{formatScore(metricValue(model, axis.id))}</td></tr>
+            })}</tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  )
+}
+
+function InvalidDimension({ showNavigation = true }) {
+  const { t, locale } = useBenchmarkLocale()
+  return (
+    <main className="bench-shell">
+      {showNavigation ? <LeaderboardNav /> : null}
+      <section className="bench-not-found">
+        <BarChart3 size={30} aria-hidden="true" />
+        <h1>{t("没有这个排行榜维度")}</h1>
+        <p>{t("链接可能已失效，返回综合总榜继续浏览七个正式维度。")}</p>
+        <a href={LEADERBOARD_HREF}><ArrowLeft size={15} />{t("返回综合总榜")}</a>
+      </section>
+    </main>
+  )
+}
+
+function BenchmarkUnavailable() {
+  const { t, locale } = useBenchmarkLocale()
+  return (
+    <main className="bench-state">
+      <BarChart3 size={28} />
+      <strong>{t("排行榜尚未开放")}</strong>
+      <span>{t("该页面当前受功能开关控制。")}</span>
+      <a href={WORKSPACE_HREF}><ArrowLeft size={15} />{t("返回工作台")}</a>
+    </main>
+  )
+}
+
+export default function BenchmarkPage({ apiBase, backendMode = 'gateway', enabled = true, pathname = globalThis.location?.pathname || '/leaderboard', showNavigation = true, embedded = false }) {
+  const route = resolveLeaderboardRoute(pathname)
+
+  if (route.invalidSlug) return <InvalidDimension showNavigation={showNavigation} />
+  if (route.modelProfileId) return <BenchmarkModelEvidencePage apiBase={apiBase} backendMode={backendMode} enabled={enabled} profileId={route.modelProfileId} showNavigation={showNavigation} />
+  if (route.caseId) return <BenchmarkCaseEvidencePage apiBase={apiBase} backendMode={backendMode} enabled={enabled} caseId={route.caseId} showNavigation={showNavigation} />
+  if (route.promptSubmission) return <BenchmarkPromptSubmissionPage apiBase={apiBase} backendMode={backendMode} showNavigation={showNavigation} />
+  if (route.promptAdmin) return <BenchmarkPromptAdminPage apiBase={apiBase} backendMode={backendMode} showNavigation={showNavigation} />
+  return <BenchmarkReleasePage apiBase={apiBase} backendMode={backendMode} enabled={enabled} pathname={pathname} showNavigation={showNavigation} embedded={embedded} />
+}
+
+function BenchmarkReleasePage({ apiBase, backendMode, enabled, pathname, showNavigation, embedded }) {
+  const { t, locale } = useBenchmarkLocale()
+  const route = resolveLeaderboardRoute(pathname)
+  const [release, setRelease] = useState(null)
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(enabled)
+
+  useEffect(() => {
+    if (!enabled || route.invalidSlug) return undefined
+    let cancelled = false
+    setLoading(true)
+    setError('')
+    benchmarkLeaderboardRequest(apiBase, { backendMode })
+      .then((data) => {
+        if (cancelled) return
+        const normalized = data.release ? normalizeLeaderboardRelease(data.release) : null
+        if (data.release && !normalized) setError('排行榜数据格式不受支持')
+        setRelease(normalized)
+      })
+      .catch((reason) => { if (!cancelled) setError(reason?.message || String(reason)) })
+      .finally(() => { if (!cancelled) setLoading(false) })
+    return () => { cancelled = true }
+  }, [apiBase, backendMode, enabled, route.invalidSlug])
+
+  if (!enabled) return <BenchmarkUnavailable />
+  if (loading) return <div className="bench-state"><Loader2 className="spin" />{t("正在读取排行榜…")}</div>
+  if (error) return <div className="bench-state bench-state-error">{t("排行榜暂不可用：")}{t(error)}</div>
+  if (!release) return <div className="bench-state">{t("排行榜尚无已发布数据。")}</div>
+  return <BenchmarkObservatory release={release} pathname={pathname} showNavigation={showNavigation} embedded={embedded} />
+}
+
+export function BenchmarkObservatory({ release, pathname = '/leaderboard', showNavigation = true, embedded = false }) {
+  const { t, locale } = useBenchmarkLocale()
+  const [filters, setFilters] = useState(() => {
+    try { const value = JSON.parse(window.sessionStorage.getItem('tuyan.benchmark.filters.v1') || '{}'); return { query: typeof value.query === 'string' ? value.query : '', vendor: typeof value.vendor === 'string' ? value.vendor : '', sortMetric: typeof value.sortMetric === 'string' ? value.sortMetric : 'overall' } } catch { return { query: '', vendor: '', sortMetric: 'overall' } }
+  })
+  useEffect(() => { try { window.sessionStorage.setItem('tuyan.benchmark.filters.v1', JSON.stringify(filters)) } catch {} }, [filters])
+  const setQuery = query => setFilters(old => ({ ...old, query }))
+  const setVendor = vendor => setFilters(old => ({ ...old, vendor }))
+  const setSortMetric = sortMetric => setFilters(old => ({ ...old, sortMetric }))
+  const sharedFilters = { query: filters.query, vendor: filters.vendor, onQuery: setQuery, onVendor: setVendor }
+  const [view, setView] = useState(() => typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('view') === 'pareto' ? 'pareto' : 'ranking')
+  useEffect(() => {
+    const sync = () => setView(new URLSearchParams(window.location.search).get('view') === 'pareto' ? 'pareto' : 'ranking')
+    window.addEventListener('popstate', sync)
+    return () => window.removeEventListener('popstate', sync)
+  }, [])
+  const scientific = release.presentationVersion === 'scientific-leaderboard-v2'
+  function changeView(next) {
+    setView(next)
+    const url = new URL(window.location.href)
+    if (next === 'pareto') url.searchParams.set('view', 'pareto')
+    else url.searchParams.delete('view')
+    window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`)
+  }
+  const models = Array.isArray(release.models) ? release.models : []
+  const axes = axesForRelease(release)
+  const filteredModels = models.filter(model => matchesBenchmarkModel(model, filters.query, filters.vendor))
+  const sortMetric = filters.sortMetric === 'overall' || axes.some(axis => axis.id === filters.sortMetric) ? filters.sortMetric : 'overall'
+  const route = resolveLeaderboardRoute(pathname)
+  if (route.invalidSlug) return <InvalidDimension showNavigation={showNavigation} />
+  if (route.dimension) return <DimensionLeaderboard axis={route.dimension} release={release} models={filteredModels} allModels={models} filters={sharedFilters} showNavigation={showNavigation} />
+  const viewSwitch = scientific ? <div className="bench-view-switch" role="group" aria-label={t("排行榜视图")}><button aria-pressed={view === 'ranking'} onClick={() => changeView('ranking')}><BarChart3 size={16} />{t("排名")}</button><button aria-pressed={view === 'pareto'} onClick={() => changeView('pareto')}><span aria-hidden="true">↗</span>{t("帕累托")}</button></div> : null
+  return (
+    <main className={`bench-shell${scientific && view === 'pareto' ? ' bench-pareto-shell' : ''}`}>
+      {showNavigation ? <LeaderboardNav /> : null}
+      <LeaderboardHero release={release} compact={scientific && view === 'pareto'} embedded={embedded} />
+
+      <div hidden={scientific && view === 'pareto'}>
+        <BenchmarkRankingFilters models={models} count={filteredModels.length} {...sharedFilters} viewSwitch={viewSwitch} />
+        {!embedded && <DimensionGrid axes={axes} models={filteredModels} />}
+        <LeaderboardMatrix axes={axes} models={filteredModels} sortMetric={sortMetric} setSortMetric={setSortMetric} />
+        {embedded && <DimensionGrid axes={axes} models={filteredModels} embedded />}
+      </div>
+      {scientific && <div hidden={view !== 'pareto'}><BenchmarkPareto models={models} axes={axes} viewSwitch={viewSwitch} sharedFilters={sharedFilters} active={view === 'pareto'} /></div>}
+    </main>
+  )
+}

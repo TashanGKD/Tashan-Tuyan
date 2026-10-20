@@ -1,0 +1,187 @@
+const DEFAULT_ORIGINS = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'https://www.paperbanana.asia',
+  'https://paperbanana.asia',
+  'https://servicewechat.com',
+  'https://developers.weixin.qq.com',
+];
+const REQUIRED_WECHAT_ORIGINS = [
+  'https://servicewechat.com',
+  'https://developers.weixin.qq.com',
+];
+
+export function parseList(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+export function loadGatewayConfig(env = process.env) {
+  const backend = { mode: 'node', url: validHttpUrl('PAPERBANANA_API_URL', required(env, 'PAPERBANANA_API_URL')) };
+  backend.timeoutMs = boundedInteger(env.PAPERBANANA_BACKEND_TIMEOUT_MS, 15_000, 100, 120_000);
+
+  const guestSecret = required(env, 'PAPERBANANA_GUEST_COOKIE_SECRET');
+  requireMinBytes('PAPERBANANA_GUEST_COOKIE_SECRET', guestSecret, 32);
+  const previousGuestSecret = stringValue(env.PAPERBANANA_GUEST_COOKIE_SECRET_PREVIOUS);
+  if (previousGuestSecret) {
+    requireMinBytes('PAPERBANANA_GUEST_COOKIE_SECRET_PREVIOUS', previousGuestSecret, 32);
+  }
+
+  const production = env.NODE_ENV === 'production';
+  const sameSite = stringValue(env.COOKIE_SAME_SITE).toLowerCase();
+  if (sameSite && !['lax', 'strict', 'none'].includes(sameSite)) {
+    throw new Error('COOKIE_SAME_SITE must be lax, strict, or none');
+  }
+  const adminUserIds = parseList(required(env, 'ADMIN_USER_IDS'));
+  if (!adminUserIds.length) {
+    throw new Error('ADMIN_USER_IDS must contain at least one immutable user ID');
+  }
+  if (adminUserIds.some((id) => !/^[A-Za-z0-9._:-]{3,200}$/.test(id))) {
+    throw new Error('ADMIN_USER_IDS must contain immutable user IDs');
+  }
+  const configuredOrigins = parseList(env.FRONTEND_ORIGINS);
+  const frontendOrigins = [
+    ...new Set([
+      ...(configuredOrigins.length ? configuredOrigins : DEFAULT_ORIGINS),
+      ...REQUIRED_WECHAT_ORIGINS,
+    ]),
+  ];
+  const emailDeliveryEnabled = parseBoolean(env.AUTH_EMAIL_DELIVERY_ENABLED);
+  const requireEmailVerification = parseBoolean(env.AUTH_REQUIRE_EMAIL_VERIFICATION);
+  if (requireEmailVerification && !emailDeliveryEnabled) {
+    throw new Error('AUTH_EMAIL_DELIVERY_ENABLED must be enabled before requiring email verification');
+  }
+  const verificationCallbackUrl = validAccountHttpsUrl(
+    'AUTH_VERIFICATION_CALLBACK_URL',
+    stringValue(env.AUTH_VERIFICATION_CALLBACK_URL)
+      || 'https://www.paperbanana.asia/account/email-verified.html',
+    env.TUYAN_PREVIEW_ORIGIN,
+  );
+  const resetPasswordUrl = validAccountHttpsUrl(
+    'AUTH_PASSWORD_RESET_URL',
+    stringValue(env.AUTH_PASSWORD_RESET_URL)
+      || 'https://www.paperbanana.asia/account/reset-password.html',
+    env.TUYAN_PREVIEW_ORIGIN,
+  );
+  const directMail = emailDeliveryEnabled
+    ? {
+        accessKeyId: required(env, 'ALIBABA_DIRECTMAIL_ACCESS_KEY_ID'),
+        accessKeySecret: required(env, 'ALIBABA_DIRECTMAIL_ACCESS_KEY_SECRET'),
+        endpoint: stringValue(env.ALIBABA_DIRECTMAIL_ENDPOINT) || 'dm.aliyuncs.com',
+        regionId: stringValue(env.ALIBABA_DIRECTMAIL_REGION_ID) || 'cn-hangzhou',
+        accountName: stringValue(env.ALIBABA_DIRECTMAIL_ACCOUNT_NAME) || 'account@mail.paperbanana.asia',
+        fromAlias: stringValue(env.ALIBABA_DIRECTMAIL_FROM_ALIAS) || '图研 Tuyan',
+      }
+    : null;
+
+  const watchaEnabled = parseBoolean(env.WATCHA_OAUTH_ENABLED);
+  const watchaScopes = [...new Set((stringValue(env.WATCHA_OAUTH_SCOPES) || 'read email').split(/\s+/))];
+  if (watchaEnabled && !emailDeliveryEnabled) throw new Error('WATCHA_OAUTH_ENABLED requires AUTH_EMAIL_DELIVERY_ENABLED');
+  if (watchaEnabled && (!watchaScopes.includes('read') || watchaScopes.some((scope) => !['read', 'email'].includes(scope)))) {
+    throw new Error('WATCHA_OAUTH_SCOPES must contain read and may contain email');
+  }
+
+  return {
+    watcha: { enabled: watchaEnabled, clientId: watchaEnabled ? required(env, 'WATCHA_CLIENT_ID') : '',
+      clientSecret: watchaEnabled ? required(env, 'WATCHA_CLIENT_SECRET') : '', scopes: watchaScopes.join(' ') },
+    production,
+    port: boundedInteger(env.PORT, 3005, 1, 65_535),
+    listenHost: stringValue(env.HOST) || '0.0.0.0',
+    authBaseUrl: validHttpUrl('AUTH_BASE_URL', required(env, 'AUTH_BASE_URL')),
+    authSecret: required(env, 'BETTER_AUTH_SECRET'),
+    mongoUri: required(env, 'MONGODB_URI'),
+    mongoDbName: stringValue(env.MONGODB_DB) || 'paperbanana_auth',
+    frontendOrigins,
+    authEmail: {
+      deliveryEnabled: emailDeliveryEnabled,
+      requireVerification: requireEmailVerification,
+      verificationCallbackUrl,
+      resetPasswordUrl,
+      windowSeconds: boundedInteger(env.AUTH_EMAIL_WINDOW_SECONDS, 900, 60, 86_400),
+      windowMax: boundedInteger(env.AUTH_EMAIL_WINDOW_MAX, 3, 1, 100),
+      dailyMax: boundedInteger(env.AUTH_EMAIL_DAILY_MAX, 10, 1, 1_000),
+      directMail,
+    },
+    cookieDomain: stringValue(env.COOKIE_DOMAIN),
+    cookieSameSite: sameSite || (production ? 'lax' : 'lax'),
+    backend,
+    gatewayToken: required(env, 'PAPERBANANA_GATEWAY_TOKEN'),
+    adminTransportToken: stringValue(env.PAPERBANANA_ADMIN_TRANSPORT_TOKEN),
+    adminUserIds: new Set(adminUserIds),
+    guestCookie: {
+      name: production ? '__Host-paperbanana_guest' : 'paperbanana_guest',
+      secret: guestSecret,
+      previousSecret: previousGuestSecret,
+      ttlSeconds: 30 * 24 * 60 * 60,
+      secure: production,
+    },
+    maintenance: {
+      markerFile: stringValue(env.PAPERBANANA_MAINTENANCE_FILE) || '/opt/paperbanana/maintenance',
+      retryAfterSeconds: boundedInteger(env.PAPERBANANA_MAINTENANCE_RETRY_AFTER_SECONDS, 300, 1, 86_400),
+      env,
+    },
+    oss: {
+      bucket: stringValue(env.PAPERBANANA_BUCKET),
+      publicEndpoint: stringValue(env.OSS_PUBLIC_ENDPOINT),
+    },
+    trustProxy: 1,
+  };
+}
+
+function required(env, name) {
+  const value = stringValue(env[name]);
+  if (!value) throw new Error(`${name} is required`);
+  return value;
+}
+
+function stringValue(value) {
+  return String(value || '').trim();
+}
+
+function requireMinBytes(name, value, size) {
+  if (Buffer.byteLength(value, 'utf8') < size) {
+    throw new Error(`${name} must be at least ${size} bytes`);
+  }
+}
+
+function validHttpUrl(name, value) {
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error(`${name} must be a valid URL`);
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error(`${name} must use http or https`);
+  }
+  return parsed.toString();
+}
+
+function validAccountHttpsUrl(name, value, previewOrigin) {
+  const normalized = validHttpUrl(name, value);
+  const parsed = new URL(normalized);
+  if (parsed.protocol !== 'https:') throw new Error(`${name} must use https`);
+  if (previewOrigin) {
+    if (!/^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.tashan\.chat$/.test(previewOrigin) || parsed.origin !== previewOrigin) throw new Error(`${name} must use the exact preview origin`);
+    return normalized;
+  }
+  if (parsed.origin !== 'https://tuyansci.cn' && parsed.hostname !== 'paperbanana.asia' && !parsed.hostname.endsWith('.paperbanana.asia')) {
+    throw new Error(`${name} must use paperbanana.asia or tuyansci.cn`);
+  }
+  return normalized;
+}
+
+function boundedInteger(value, fallback, min, max) {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`Expected integer between ${min} and ${max}`);
+  }
+  return parsed;
+}
+
+function parseBoolean(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}

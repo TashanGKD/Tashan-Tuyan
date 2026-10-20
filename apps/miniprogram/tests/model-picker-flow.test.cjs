@@ -1,0 +1,122 @@
+const assert = require('node:assert/strict')
+
+let definition
+global.Component = (value) => { definition = value }
+require('../miniprogram/components/model-picker/model-picker.js')
+const { getModelRegistryState } = require('../miniprogram/utils/model-registry-store.js')
+
+assert.equal(typeof definition.methods.resetFlow, 'function')
+assert.equal(typeof definition.methods.selectProvider, 'function')
+assert.equal(typeof definition.methods.selectVendor, 'function')
+assert.equal(typeof definition.methods.backStep, 'function')
+
+function model(id, vendor, recommended = true) {
+  return {
+    id,
+    label: id,
+    vendor,
+    lifecycle: 'stable',
+    recommended,
+    requiresEntitlement: false,
+    entitlement: '',
+    verified: true,
+    verificationState: 'registry',
+    selectable: true,
+    disabledReason: '',
+    roles: ['main'],
+    roleReasons: {},
+    inputModalities: [],
+    outputModalities: [],
+    protocol: '',
+    availabilityNotes: '',
+    releasedAt: '',
+    capabilities: {},
+  }
+}
+
+function disabledModel(id, vendor) {
+  return {
+    ...model(id, vendor, false),
+    selectable: false,
+    disabledReason: '当前账号未开通',
+  }
+}
+
+const registry = {
+  providers: {
+    gemini: { accessKind: 'direct', models: [model('gemini-main', 'Google')] },
+    openai: { accessKind: 'direct', models: [model('openai-main', 'OpenAI')] },
+    bailian: { accessKind: 'aggregator', models: [model('qwen-main', 'Alibaba Qwen'), model('deepseek-main', 'DeepSeek')] },
+    ark: { accessKind: 'aggregator', models: [model('ark-main', 'ByteDance Doubao'), disabledModel('ark-disabled', 'Restricted Vendor')] },
+    openrouter: { accessKind: 'aggregator', models: [model('or-main', 'OpenAI'), model('or-claude', 'Anthropic', false)] },
+  },
+}
+
+getModelRegistryState().registry = registry
+
+function context() {
+  const state = JSON.parse(JSON.stringify(definition.data))
+  return Object.assign({
+    data: state,
+    properties: { registryVersion: 'fixture', role: 'main', outputFormat: 'png', selectedProvider: 'bailian', selectedModel: 'qwen-main' },
+    setData(patch) { Object.assign(state, patch) },
+    triggerEvent() {},
+  }, definition.methods)
+}
+
+const picker = context()
+picker.resetFlow()
+assert.equal(picker.data.step, 'providers')
+assert.equal(picker.data.providerCards.find((item) => item.id === 'ark').unavailableCount, undefined)
+
+picker.selectProvider({ currentTarget: { dataset: { provider: 'bailian' } } })
+assert.equal(picker.data.step, 'vendors')
+assert.deepEqual(picker.data.vendorCards.map((item) => item.vendor), ['阿里巴巴', '深度求索'])
+
+assert.deepEqual(picker.data.visibleCompatibleModels, [])
+picker.selectVendor({ currentTarget: { dataset: { vendor: '深度求索' } } })
+assert.equal(picker.data.step, 'models')
+assert.deepEqual(picker.data.visibleCompatibleModels.map((item) => item.id), ['deepseek-main'])
+
+picker.backStep()
+assert.equal(picker.data.step, 'vendors')
+picker.backStep()
+assert.equal(picker.data.step, 'providers')
+
+picker.selectProvider({ currentTarget: { dataset: { provider: 'gemini' } } })
+assert.equal(picker.data.step, 'vendors')
+picker.selectVendor({ currentTarget: { dataset: { vendor: '谷歌' } } })
+assert.equal(picker.data.step, 'models')
+assert.deepEqual(picker.data.visibleCompatibleModels.map((item) => item.id), ['gemini-main'])
+
+picker.backStep()
+picker.selectProvider({ currentTarget: { dataset: { provider: 'openrouter' } } })
+picker.selectVendor({ currentTarget: { dataset: { vendor: 'Anthropic' } } })
+assert.equal(picker.data.catalogMode, 'all')
+assert.deepEqual(picker.data.visibleCompatibleModels.map((item) => item.id), ['or-claude'])
+
+picker.backStep()
+picker.backStep()
+picker.selectProvider({ currentTarget: { dataset: { provider: 'ark' } } })
+assert.equal(picker.data.vendorCards.some((item) => item.vendor === 'Restricted Vendor'), false)
+assert.equal(picker.data.incompatibleModels, undefined)
+
+delete global.Component
+console.log('model-picker-flow.test.cjs passed')
+
+// Sorting categories are internal; the visible labels retain the previous style.
+assert.ok(picker.data.providerCards.every(card => !/国内|国外/.test(card.label+' '+card.kindText)))
+assert.equal(picker.data.providerCards.find(card=>card.id==='bailian').kindText,'聚合渠道')
+registry.providers.deepseek = {accessKind:'direct',models:[{
+  ...model('deepseek-v4-pro','深度求索'), label:'DeepSeek-V4-Pro-0813',
+  version:{kind:'rolling',id:'DeepSeek-V4-Pro-0813',checkedAt:'2026-09-21',sourceUrl:'https://api-docs.deepseek.com/quick_start/pricing'},
+}]}
+picker.resetFlow()
+picker.selectProvider({currentTarget:{dataset:{provider:'deepseek'}}})
+picker.selectVendor({currentTarget:{dataset:{vendor:'深度求索'}}})
+const precise=picker.data.visibleCompatibleModels[0]
+assert.equal(precise.id,'deepseek-v4-pro')
+assert.equal(precise.label,'DeepSeek-V4-Pro-0813')
+assert.equal(precise.versionLabel,'滚动别名')
+assert.match(precise.versionText,/DeepSeek-V4-Pro-0813/)
+assert.equal(precise.apiIdentifier,'deepseek-v4-pro')
