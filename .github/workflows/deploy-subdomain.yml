@@ -88,11 +88,17 @@ jobs:
           test "$DEPLOY_USER" = deploy
           test -n "$PREVIEW_OSS_CONFIG"
           task_ssh_dir="$(mktemp -d)"
-          trap 'rm -rf "$task_ssh_dir"' EXIT
+          cleanup() {
+            if [[ -n "${docker_config:-}" ]]; then
+              ssh "${ssh_args[@]}" "$target" "rm -rf '$docker_config'" || true
+            fi
+            rm -rf "$task_ssh_dir"
+          }
+          trap cleanup EXIT
           printf '%s\n' "$SSH_PRIVATE_KEY" > "$task_ssh_dir/key"
           printf '%s\n' "$SSH_KNOWN_HOSTS" > "$task_ssh_dir/known_hosts"
           chmod 600 "$task_ssh_dir/key"
-          ssh_args=(-i "$task_ssh_dir/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o "UserKnownHostsFile=$task_ssh_dir/known_hosts")
+          ssh_args=(-i "$task_ssh_dir/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=6 -o ConnectTimeout=20 -o "UserKnownHostsFile=$task_ssh_dir/known_hosts")
           target="$DEPLOY_USER@$DEPLOY_HOST"
           remote="tuyan-previews/$UID_NAME"
           ssh "${ssh_args[@]}" "$target" "umask 077; mkdir -p '$remote'"
@@ -101,5 +107,4 @@ jobs:
           docker_config="/tmp/$UID_NAME-${GITHUB_RUN_ID}-docker"
           printf '%s' "$GH_TOKEN" | ssh "${ssh_args[@]}" "$target" "umask 077; docker --config '$docker_config' login ghcr.io -u '$ACTOR' --password-stdin"
           ssh "${ssh_args[@]}" "$target" "DOCKER_CONFIG='$docker_config' bash '$remote/deploy.sh' 'ghcr.io/tashangkd/tashan-tuyan@$DIGEST' '$UID_NAME' '$GITHUB_SHA' '$BRANCH'"
-          ssh "${ssh_args[@]}" "$target" "rm -rf '$docker_config'"
           echo "Preview: https://$UID_NAME.tashan.chat/" >> "$GITHUB_STEP_SUMMARY"
