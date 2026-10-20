@@ -63,11 +63,28 @@ EOF
   sudo systemctl reload nginx || return 1
 }
 start_image() {
+  local port
   bash "$SHARED_SCRIPT" "$1" "$UID_NAME" "$CONTAINER" "" 8080 /data || return 1
-  docker update --memory 3g --memory-swap 3g --cpus 1.5 --pids-limit 256 "$CONTAINER" >/dev/null || return 1
+  port="$(docker port "$CONTAINER" 8080/tcp | head -n1 | awk -F: '{print $NF}')" || return 1
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  # Keep the shared script unchanged. Pin only this application's allocated port,
+  # since Docker's -P assignment can change when its container restarts.
+  docker stop --timeout 30 "$CONTAINER" >/dev/null || return 1
+  docker rm "$CONTAINER" >/dev/null || return 1
+  docker run -d --name "$CONTAINER" --restart unless-stopped \
+    --memory 3g --memory-swap 3g --cpus 1.5 --pids-limit 256 \
+    --publish "127.0.0.1:$port:8080" \
+    --mount "type=volume,src=$VOLUME,dst=/data" "$1" >/dev/null || return 1
   configure_own_site || return 1
   for _ in {1..60}; do
-    [[ "$(docker inspect "$CONTAINER" --format '{{.State.Health.Status}}')" == healthy ]] && return 0
+    if [[ "$(docker inspect "$CONTAINER" --format '{{.State.Health.Status}}')" == healthy ]]; then
+      curl --fail --silent --show-error --max-time 15 "https://$DOMAIN/ready" >/dev/null || return 1
+      # Read-only business request proves that Gateway reaches Core's actual API.
+      curl --fail --silent --show-error --max-time 30 "https://$DOMAIN/paperbanana-api" \
+        -H 'Content-Type: application/json' --data '{"action":"modelRegistry"}' \
+        | python3 -c 'import json,sys; assert json.load(sys.stdin).get("code") == 0' || return 1
+      return 0
+    fi
     sleep 5
   done
   return 1

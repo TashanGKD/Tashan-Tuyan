@@ -9,6 +9,10 @@
 - [x] Deployment: document's existing `deploy-subdomain.sh`, own Docker image,
   `/data` named volume, independent Mongo replica set, random persistent secrets
   and independent private OSS. No production data migration.
+- [x] Deployment validation: Gateway uses Core's `/paperbanana-api` path;
+  a real read-only business request gates deployment success. This container
+  pins its allocated port to loopback so restarts preserve Nginx connectivity.
+- [x] Preview signup explains the email/password flow without email delivery.
 - [ ] Runtime verification: record actual deployment and acceptance evidence.
 - [ ] External integrations: email delivery, Watcha SSO, gVisor plot execution,
   foreign-provider routing and real model generation need separate validation.

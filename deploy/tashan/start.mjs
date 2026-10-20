@@ -94,7 +94,7 @@ try {
   } });
   run('gateway', 'node', ['src/server.js'], { cwd: '/opt/gateway/apps/auth-gateway', uid: 1001, gid: 1001, env: {
     ...common, HOME: '/home/preview', HOST: '127.0.0.1', PORT: '3005', NODE_OPTIONS: '--max-old-space-size=384',
-    PAPERBANANA_API_URL: 'http://127.0.0.1:3000', AUTH_BASE_URL: origin, FRONTEND_ORIGINS: origin,
+    PAPERBANANA_API_URL: 'http://127.0.0.1:3000/paperbanana-api', AUTH_BASE_URL: origin, FRONTEND_ORIGINS: origin,
     BETTER_AUTH_SECRET: state.auth, PAPERBANANA_GUEST_COOKIE_SECRET: state.guest,
     ADMIN_USER_IDS: `unassigned-preview-${state.admin}`, COOKIE_DOMAIN: '', COOKIE_SAME_SITE: 'lax',
     MONGODB_URI: uri('preview_auth', state.mongoAuth, 'tuyan_preview_auth'), MONGODB_DB: 'tuyan_preview_auth',
