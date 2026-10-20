@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { loadGatewayConfig } from '../../apps/auth-gateway/src/config.js';
-const origin = 'https://tuyan-preview-codex-preview.tashan.chat';
+const origin = 'https://tashan-tuyan-codex-test.tashan.chat';
 
 test('preview browser API and account links never fall back to a production origin', async () => {
   const source = readFileSync(new URL('../../apps/web/src/lib/runtimePolicy.js', import.meta.url), 'utf8')
@@ -31,7 +31,7 @@ test('gateway accepts the exact preview callbacks and rejects production and nei
   const config = loadGatewayConfig(env);
   assert.equal(config.authEmail.resetPasswordUrl, env.AUTH_PASSWORD_RESET_URL);
   assert.ok(!config.frontendOrigins.includes('https://tuyansci.cn'));
-  for (const value of ['https://tuyansci.cn', 'https://neighbor.tashan.chat', 'http://tuyan-preview-codex-preview.tashan.chat']) {
+  for (const value of ['https://tuyansci.cn', 'https://neighbor.tashan.chat', 'http://tashan-tuyan-codex-test.tashan.chat']) {
     assert.throws(() => loadGatewayConfig({ ...env, AUTH_PASSWORD_RESET_URL: value }), /exact preview|https/);
   }
 });

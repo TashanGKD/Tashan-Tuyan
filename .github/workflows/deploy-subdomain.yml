@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   identity:
-    if: github.repository == 'TashanGKD/tuyan-preview' && startsWith(github.ref, 'refs/heads/codex/')
+    if: github.repository == 'TashanGKD/Tashan-Tuyan' && startsWith(github.ref, 'refs/heads/codex/')
     runs-on: ubuntu-latest
     outputs:
       uid: ${{ steps.identity.outputs.uid }}
@@ -54,7 +54,7 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64
-          tags: ghcr.io/tashangkd/tuyan-preview:sha-${{ github.sha }}
+          tags: ghcr.io/tashangkd/tashan-tuyan:sha-${{ github.sha }}
           build-args: |
             TUYAN_PREVIEW_ORIGIN=${{ needs.identity.outputs.origin }}
             TUYAN_REVISION=${{ github.sha }}
@@ -100,6 +100,6 @@ jobs:
           scp "${ssh_args[@]}" deploy/tashan/deploy.sh "$target:$remote/deploy.sh"
           docker_config="/tmp/$UID_NAME-${GITHUB_RUN_ID}-docker"
           printf '%s' "$GH_TOKEN" | ssh "${ssh_args[@]}" "$target" "umask 077; docker --config '$docker_config' login ghcr.io -u '$ACTOR' --password-stdin"
-          ssh "${ssh_args[@]}" "$target" "DOCKER_CONFIG='$docker_config' bash '$remote/deploy.sh' 'ghcr.io/tashangkd/tuyan-preview@$DIGEST' '$UID_NAME' '$GITHUB_SHA' '$BRANCH'"
+          ssh "${ssh_args[@]}" "$target" "DOCKER_CONFIG='$docker_config' bash '$remote/deploy.sh' 'ghcr.io/tashangkd/tashan-tuyan@$DIGEST' '$UID_NAME' '$GITHUB_SHA' '$BRANCH'"
           ssh "${ssh_args[@]}" "$target" "rm -rf '$docker_config'"
           echo "Preview: https://$UID_NAME.tashan.chat/" >> "$GITHUB_STEP_SUMMARY"

@@ -5,9 +5,9 @@ import re
 import sys
 
 def identity(repository, branch):
-    if repository != 'TashanGKD/tuyan-preview':
-        raise ValueError('This workflow belongs to TashanGKD/tuyan-preview')
-    if not branch.startswith('codex/'):
+    if repository != 'TashanGKD/Tashan-Tuyan':
+        raise ValueError('This workflow belongs to TashanGKD/Tashan-Tuyan')
+    if not re.fullmatch(r'codex/[A-Za-z0-9._/-]+', branch):
         raise ValueError('Only codex/ test branches may deploy')
     def slug(text):
         return re.sub(r'[^a-z0-9]+', '-', text.lower()).strip('-')

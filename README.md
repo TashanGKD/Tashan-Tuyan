@@ -1,4 +1,4 @@
-# 图研 Tuyan：他山分支预览
+# Tashan-Tuyan
 
 基于公开的 [yrjmdqmmx/Tuyan](https://github.com/yrjmdqmmx/Tuyan)，
 沿用 Apache 2.0 许可证，原始提交见 `UPSTREAM.json`。
